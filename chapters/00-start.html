@@ -55,10 +55,9 @@
     </div>
 
     <p>
-      这三件事分别由三个独立进程完成，主链路通过 Kubernetes 上的注解
-      （annotation）字符串传话。NUMA refit 是一个例外：设备插件会直接调用调度器的
-      <code>/refit</code> 接口，第 10 章会展开。
-      这就是下一章要讲的注解协议，也是整个项目的骨架。
+      三个独立进程，主链路全靠注解字符串传话（唯一的例外是 NUMA refit，
+      设备插件会直接请求调度器的 <code>/refit</code> 接口，第 10 章展开）。
+      这个注解协议就是整个项目的骨架，也是第 01 章的内容。
     </p>
 
     <h2>2. 环境准备（15 分钟）</h2>
@@ -169,11 +168,11 @@ $(DEVICES):
       </p>
     </div>
 
-    <h3>三个二进制，三个战场</h3>
+    <h3>3 个可执行文件 + 1 个动态库，分布在 3 个位置</h3>
 
     <div class="tbl-wrap">
     <table>
-      <tr><th style="width:150px">二进制</th><th style="width:110px">部署形态</th><th style="width:180px">入口</th><th>职责</th></tr>
+      <tr><th style="width:150px">产物</th><th style="width:110px">部署形态</th><th style="width:180px">入口</th><th>职责</th></tr>
       <tr>
         <td><b>scheduler</b></td>
         <td>Deployment<br>（集群里 1~N 个，选主）</td>
@@ -193,7 +192,7 @@ $(DEVICES):
         <td>读容器共享内存里的用量，暴露 Prometheus 指标</td>
       </tr>
       <tr>
-        <td><i>libvgpu.so</i><br>（不是 Go）</td>
+        <td><i>libvgpu.so</i><br>（C 动态库）</td>
         <td>挂进每个业务容器</td>
         <td><span data-srcref="libvgpu/src/libvgpu.c"></span></td>
         <td>C 语言写的 CUDA/NVML 劫持库，真正执行显存和算力限制</td>
