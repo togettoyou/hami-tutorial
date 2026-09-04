@@ -1,0 +1,784 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · 并发与一致性 — HAMi 源码导读</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2316181d'/%3E%3Ctext x='16' y='23' font-size='17' font-family='monospace' font-weight='bold' fill='%23fff' text-anchor='middle'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main class="main">
+
+    <div class="page-kicker">第 07 章 · 第三阶段 硬骨头</div>
+    <h1 class="page-title">并发与一致性：缓存、事件、选主</h1>
+    <p class="page-lede">
+      HAMi 的调度决策<strong>完全建立在一份本地缓存之上</strong>。
+      缓存错一点，就会超卖或者资源泄漏。这一章讲这份缓存怎么维护、
+      有哪些并发陷阱 —— 也是最容易做出高价值贡献的地方。
+    </p>
+
+    <div class="goals">
+      <h3>学完这章你应该能</h3>
+      <ul>
+        <li>说出 HAMi 里所有的锁、各自保护什么、粒度多大</li>
+        <li>画出 Pod informer 三个回调的完整决策树（包括 terminating 的特殊处理）</li>
+        <li>解释 <code>synced</code> 标志为什么必须在 register 的最后一行才置 true</li>
+        <li>说清楚 leader 选举失败时会发生什么，以及为什么 follower 不能 register</li>
+        <li>找出至少三处「如果改错就会导致超卖/泄漏」的代码位置</li>
+      </ul>
+    </div>
+
+    <h2>1. 全景：三个并发实体</h2>
+
+    <div class="flow">
+      <div class="node">
+        <div class="h">① Informer 事件循环<span class="tag">client-go 的 goroutine</span></div>
+        <div class="d">
+          Pod add/update/delete、Node add/delete、ResourceQuota add/update/delete<br>
+          随时可能触发，改 podManager 和 quotaManager
+        </div>
+        <div class="src"><span data-srcref="pkg/scheduler/scheduler.go:378"></span></div>
+      </div>
+      <div class="arrow">⇅ 共享 <code>podManager</code> / <code>overviewstatus</code></div>
+      <div class="node">
+        <div class="h">② register 巡检循环<span class="tag">独立 goroutine，15 秒一轮</span></div>
+        <div class="d">
+          扫所有节点 → 握手 → 解析设备清单 → 重建 overviewstatus 全量快照
+        </div>
+        <div class="src"><span data-srcref="pkg/scheduler/scheduler.go:436"></span></div>
+      </div>
+      <div class="arrow">⇅</div>
+      <div class="node">
+        <div class="h">③ HTTP 请求处理<span class="tag">每个请求一个 goroutine</span></div>
+        <div class="d">
+          <code>/filter</code>（读缓存 + 写记账）、<code>/bind</code>（抢锁）、<code>/refit</code>（改已有分配）<br>
+          内部还会为每个节点再起 goroutine 并发打分
+        </div>
+      </div>
+    </div>
+
+    <h2>2. HAMi 的所有锁</h2>
+
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:170px">锁</th><th style="width:130px">类型</th><th>保护什么</th></tr>
+      <tr>
+        <td><code>Scheduler.lock</code><br><span data-srcref="pkg/scheduler/scheduler.go:78"></span></td>
+        <td><code>sync.RWMutex</code></td>
+        <td><code>overviewstatus</code>（节点用量总览快照）。register 写、<code>InspectAllNodesUsage</code> 读。<br>读多写少，所以用读写锁</td>
+      </tr>
+      <tr>
+        <td><code>Scheduler.allocLock</code><br><span data-srcref="pkg/scheduler/scheduler.go:86"></span></td>
+        <td><code>sync.Mutex</code></td>
+        <td><b>预留账本的三条修改路径</b>：<code>Filter</code>、<code>RefitNumaAllocation</code>、<code>onUpdatePod</code> 的 init 用量释放。<br>保证不会看到「改了一半」的账</td>
+      </tr>
+      <tr>
+        <td><code>Scheduler.synced</code></td>
+        <td><code>atomic.Bool</code></td>
+        <td>缓存是否就绪。<b>不是锁</b>，是标志位，用原子操作避免撕裂读</td>
+      </tr>
+      <tr>
+        <td><code>Scheduler.started</code></td>
+        <td><code>uint32</code> + atomic</td>
+        <td>informer 是否已启动。register 循环靠它判断能不能开工</td>
+      </tr>
+      <tr>
+        <td><code>PodManager</code> 内部锁</td>
+        <td><code>sync.RWMutex</code></td>
+        <td>Pod → 分配记录的 map</td>
+      </tr>
+      <tr>
+        <td><code>nodeLocks</code>（每节点一把）<br><span data-srcref="pkg/util/nodelock/nodelock.go:72"></span></td>
+        <td><code>map[string]*sync.Mutex</code></td>
+        <td>同一节点上的注解 read-modify-write。<b>不同节点可并行</b></td>
+      </tr>
+      <tr>
+        <td><code>hami.io/mutex.lock</code></td>
+        <td>Node 注解（分布式）</td>
+        <td>跨进程、跨调度器副本的互斥（第 06 章）</td>
+      </tr>
+      <tr>
+        <td>打分时的两把 Mutex</td>
+        <td><code>sync.Mutex</code></td>
+        <td><code>calcScoreWithOptions</code> 里 <code>fitNodesMutex</code> / <code>failedNodesMutex</code> 保护并发写结果切片</td>
+      </tr>
+    </table>
+    </div>
+
+    <div class="note tip">
+      <div class="t">读代码技巧：先找锁，再找它保护的字段</div>
+      <div class="codeblock" data-lang="bash">
+<pre><code># 一眼看完所有锁的声明和使用
+grep -rn "sync.Mutex\|sync.RWMutex\|atomic\." pkg/scheduler/ pkg/device/ pkg/util/ --include=*.go | grep -v _test</code></pre>
+      </div>
+      <p style="margin-bottom:0">
+        在并发代码里，「哪些字段被哪把锁保护」是最重要的隐式契约。
+        HAMi 大部分地方在锁声明处写了注释说明，
+      </p>
+    </div>
+
+    <h2>3. Pod 事件回调：账本的生命线</h2>
+
+    <p>
+      <code>podManager</code> 是「谁占了哪张卡多少显存」的唯一真相来源。
+      它只被三个 informer 回调和 Filter 修改。任何一个分支写错，
+      直接导致超卖或泄漏。
+    </p>
+
+    <div class="lab">
+      <header>Pod 事件决策树<span class="badge">互动</span></header>
+      <div class="body">
+        <p style="font-size:13.5px;color:var(--fg-soft);margin-bottom:12px">
+          选一个 Pod 状态，看 informer 回调怎么处理它。
+        </p>
+        <div class="field-row">
+          <div style="flex:1 1 160px"><label class="f">事件类型</label>
+            <select id="ev_type">
+              <option value="add">onAddPod</option>
+              <option value="update">onUpdatePod</option>
+              <option value="del">onDelPod</option>
+            </select>
+          </div>
+          <div style="flex:1 1 240px"><label class="f">Pod 状态</label>
+            <select id="ev_state">
+              <option value="normal">正常运行中（Running）</option>
+              <option value="noanno">没有 hami.io/vgpu-node 注解</option>
+              <option value="terminated">已终止（Succeeded / Failed）</option>
+              <option value="terminating">正在删除（DeletionTimestamp 不为空）</option>
+              <option value="initdone">所有非 sidecar InitContainer 刚跑完</option>
+              <option value="notcached">缓存里没有（调度器刚重启，informer 重放）</option>
+            </select>
+          </div>
+        </div>
+        <div class="out" id="evOut"></div>
+      </div>
+    </div>
+
+    <h3>3.1 onAddPod：四道判断</h3>
+
+    <div class="codeblock" data-file="pkg/scheduler/scheduler.go" data-start="141" data-lang="go" data-hl="7-10,12-17,19-28,30-33,35-40">
+<pre><code>func (s *Scheduler) onAddPod(obj any) {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok {
+		klog.ErrorS(fmt.Errorf("invalid pod object"), "Failed to process pod addition")
+		return
+	}
+	klog.V(5).InfoS("Pod added", "pod", pod.Name, "namespace", pod.Namespace)
+	nodeID, ok := pod.Annotations[util.AssignedNodeAnnotations]
+	if !ok {
+		return                                       // ① 没被 HAMi 调度过 → 不关我事
+	}
+	if util.IsPodInTerminatedState(pod) {
+		if pi, ok := s.podManager.TakeAndDeletePod(pod); ok {
+			s.quotaManager.RmUsage(pod, pi.Devices)  // ② 已终止 → 释放资源
+		}
+		return
+	}
+	if util.IsPodTerminating(pod) {
+		// A terminating pod still holds its devices. When it is already
+		// cached, refresh the object; when it is not (the informer's initial
+		// sync after a scheduler restart replays it as an add), fall through
+		// so its usage is accounted instead of silently dropped.
+		if _, cached := s.podManager.GetPod(pod); cached {
+			klog.V(5).InfoS("Pod is terminating but holding locks, preserving cache", "pod", pod.Name)
+			s.podManager.UpdatePod(pod)              // ③ 正在删但还占着卡 → 保留记账
+			return
+		}
+	}
+
+	rawDevices, err := device.DecodePodDevices(device.SupportDevices, pod.Annotations)
+	if err != nil {
+		klog.ErrorS(err, "failed to decode pod devices", "pod", klog.KObj(pod))
+		return
+	}
+
+	effectiveDevices := device.CollapseInitContainerUsage(pod, rawDevices)
+
+	if s.podManager.AddPod(pod, nodeID, effectiveDevices) {   // ④ 正常路径：记账
+		s.quotaManager.AddUsage(pod, effectiveDevices)
+	}
+}</code></pre>
+    </div>
+
+    <div class="note trap">
+      <div class="t">第 ③ 条那段注释，讲的是一个真实 bug</div>
+      <p>
+        「正在删除的 Pod 仍然占着卡」。这是对的，
+        Pod 有 DeletionTimestamp 之后容器还在跑，GPU 还在用，资源不能立刻释放。
+      </p>
+      <p style="margin-bottom:0">
+        但注释说的第二种情况更微妙：<strong>调度器重启后</strong>，
+        informer 会把集群里所有已存在的 Pod 当作 <code>add</code> 事件重放一遍。
+        如果这时有一个正在删除的 Pod，而缓存里当然没有它（刚重启，缓存是空的），
+        早期版本会直接 return，导致这个 Pod 占的显存永远统计不到 → 超卖。
+        <br>修复方式就是这个 <code>if cached</code> 判断：
+        没缓存过就不 return，继续往下走正常记账路径。
+        <br><em>「组件重启后 informer 重放全量事件」是 K8s controller 开发的经典陷阱，
+        每个回调都要问自己「这个事件如果是重放的，我处理对了吗」。</em>
+      </p>
+    </div>
+
+    <h3>3.2 onUpdatePod：多了一个「用量收缩」</h3>
+
+    <div class="codeblock" data-file="pkg/scheduler/scheduler.go" data-start="183" data-lang="go" data-hl="20-25,27-31,33-37,39-40,42-45,47-59">
+<pre><code>func (s *Scheduler) onUpdatePod(oldObj, newObj any) {
+	newPod, ok := newObj.(*corev1.Pod)
+	if !ok {
+		return
+	}
+	klog.V(5).InfoS("Pod updated", "pod", klog.KObj(newPod))
+
+	if _, ok := newPod.Annotations[util.AssignedNodeAnnotations]; !ok {
+		return
+	}
+	if util.IsPodInTerminatedState(newPod) {
+		if pi, ok := s.podManager.TakeAndDeletePod(newPod); ok {
+			s.quotaManager.RmUsage(newPod, pi.Devices)
+		}
+		return
+	}
+	if util.IsPodTerminating(newPod) {
+		// Same as onAddPod: a resync update for a terminating pod that is
+		// missing from the cache must be accounted, not dropped.
+		if _, cached := s.podManager.GetPod(newPod); !cached {
+			s.onAddPod(newPod)                       // 复用 add 的逻辑
+			return
+		}
+		s.podManager.UpdatePod(newPod)
+		return
+	}
+
+	// RefitNumaAllocation reads the release flag, devices, and quota as one
+	// accounting snapshot. Keep the normal update and the one-time init-usage
+	// transition in the same critical section so a refit cannot commit from a
+	// stale pre-release snapshot after this handler records steady-state usage.
+	s.allocLock.Lock()                               // 跟 Filter 用同一把锁
+	defer s.allocLock.Unlock()
+
+	pi, exists := s.podManager.GetPod(newPod)
+	if !exists {
+		s.onAddPod(newPod)
+		return
+	}
+
+	s.podManager.UpdatePod(newPod)
+
+	if !pi.InitContainerResourceReleased &amp;&amp; util.AllNonSidecarInitContainersSucceeded(newPod) {
+		rawDevices, err := device.DecodePodDevices(device.SupportDevices, newPod.Annotations)
+		if err != nil {
+			klog.ErrorS(err, "failed to decode pod devices during shrink", "pod", klog.KObj(newPod))
+			return
+		}
+
+		steadyStateDevices := device.SteadyStateDeviceUsage(newPod, rawDevices)   // 收缩
+
+		oldDevices, ok := s.podManager.UpdatePodDevice(newPod, steadyStateDevices)
+		if ok {
+			s.quotaManager.ReplaceUsage(newPod, oldDevices, steadyStateDevices)
+			klog.InfoS("Non-sidecar init containers completed, shrunk usage to steady state",
+				"pod", klog.KObj(newPod),
+				"oldUsage", oldDevices,
+				"newUsage", steadyStateDevices,
+			)
+		}
+	}
+}</code></pre>
+    </div>
+
+    <div class="note">
+      <div class="t">「用量收缩」是什么</div>
+      <p>
+        回忆第 03、05 章：调度时按 <code>max(init 峰值, sidecar + 普通容器)</code> 预留资源。
+        如果某个 InitContainer 要 8000MB 而普通容器只要 3000MB，
+        <strong>调度时预留的是 8000MB</strong>。
+      </p>
+      <p style="margin-bottom:0">
+        但 InitContainer 跑完就退出了，那 5000MB 就白占着。
+        所以这里检测到「所有非 sidecar InitContainer 都成功了」，
+        就把账本<strong>收缩到稳态用量</strong>。把多占的 5000MB 还回去，
+        让别的 Pod 能用上。
+        <br><code>InitContainerResourceReleased</code> 是幂等标志，保证只收缩一次。
+      </p>
+    </div>
+
+    <div class="note warn">
+      <div class="t">注意 <code>allocLock</code> 的位置</div>
+      <p style="margin-bottom:0">
+        锁是在前面几个 return 分支之后才加的 ——
+        terminated / terminating 的处理不需要这把锁。
+        <br>而注释解释了为什么「普通 update」和「一次性的收缩」必须在<strong>同一个临界区</strong>：
+        如果分成两段，NUMA refit（第 10 章）可能在中间插进来，
+        基于「收缩前」的快照做决策，然后提交一个过时的分配 → 账本错乱。
+      </p>
+    </div>
+
+    <h2>4. register 巡检循环</h2>
+
+    <div class="codeblock" data-file="pkg/scheduler/scheduler.go" data-start="436" data-lang="go" data-hl="7-8,11-22,24-27,29">
+<pre><code>func (s *Scheduler) RegisterFromNodeAnnotations() {
+	klog.InfoS("Entering RegisterFromNodeAnnotations")
+	defer klog.InfoS("Exiting RegisterFromNodeAnnotations")
+
+	labelSelector := labels.Set(config.NodeLabelSelector).AsSelector()
+	klog.InfoS("Using label selector for list nodes", "selector", labelSelector.String())
+
+	ticker := time.NewTicker(time.Second * 15)          // 15 秒一轮
+	defer ticker.Stop()
+	printedLog := map[string]bool{}
+	for {
+		select {
+		case &lt;-s.nodeNotify:                            // 节点增删 → 立即触发
+			klog.V(5).InfoS("Received node notification")
+		case &lt;-s.leaderNotify:                          // 刚当选 leader → 立即触发
+			klog.V(5).InfoS("Received leaderElection notification. We are just elected to leader")
+		case &lt;-ticker.C:                                // 定时触发
+			klog.V(5).InfoS("Ticker triggered")
+		case &lt;-s.stopCh:
+			klog.InfoS("Received stop signal, exiting RegisterFromNodeAnnotations")
+			return
+		}
+		if atomic.LoadUint32(&amp;s.started) == 0 {
+			klog.V(5).InfoS("Scheduler not started yet, skipping ...")
+			continue                                    // informer 还没起来，跳过
+		}
+		s.register(labelSelector, printedLog)
+	}
+}</code></pre>
+    </div>
+
+    <div class="note tip">
+      <div class="t">三个触发源合并成一个 select：事件驱动 + 定时兜底</div>
+      <p style="margin-bottom:0">
+        <b>事件驱动</b>（<code>nodeNotify</code>、<code>leaderNotify</code>）保证响应快；
+        <b>15 秒定时器</b>保证即使漏了事件也能自愈。
+        <br>这是写 controller 的标准模式：<strong>永远不要只依赖事件</strong>，
+        因为事件可能丢失、乱序、重复。定时全量对账是最后一道保险。
+      </p>
+    </div>
+
+    <h3>4.1 <code>synced</code> 标志的严格时序</h3>
+
+    <div class="codeblock" data-file="pkg/scheduler/scheduler.go" data-start="466" data-lang="go" data-hl="2-6,8-11,13-15">
+<pre><code>func (s *Scheduler) register(labelSelector labels.Selector, printedLog map[string]bool) {
+	// Lock here to avoid setting s.synced to false, when we lost leadership, while doing register.
+	// 1. lost leadership before register: synced will set to false in callbacks, and register will be skipped because IsLeader() returns false
+	// 2. lost leadership during or after register: synced will set to true after finishing register, and callback will set it to false again after lock is acquired by callback
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	// Only do registration when we are leader.
+	isLeader := s.leaderManager.IsLeader()
+	if isLeader {
+		s.updateSchedulerLabel()
+	} else {
+		klog.V(5).InfoS("Scheduler is not leader yet, skipping ...")
+		return                                       // follower 不做注册
+	}
+	...</code></pre>
+    </div>
+
+    <div class="codeblock" data-file="pkg/scheduler/scheduler.go" data-start="570" data-lang="go" data-hl="1-6,8-9">
+<pre><code>	_, overallnodeMap, _, err := s.getNodesUsage(&amp;nodeNames, nil)
+	if err != nil {
+		klog.ErrorS(err, "Failed to get node usage", "nodeNames", nodeNames)
+		return                                       // 失败就不置 synced
+	}
+	s.overviewstatus = *overallnodeMap
+
+	// Set synced to true only after getNodeUsage() succeeds
+	s.synced.Store(true)                             // 最后一行才置 true
+}</code></pre>
+    </div>
+
+    <div class="note trap">
+      <div class="t">为什么 <code>synced</code> 必须是最后一行</div>
+      <p style="margin-bottom:0">
+        HTTP 层的 <code>WaitForCacheSync</code>（第 04 章）就等这个标志。
+        如果提前置 true，filter 请求会在<strong>缓存只填了一半</strong>的时候进来，
+        看到「有些节点没有 GPU」，把 Pod 误判为不可调度。
+        <br>而且注意：中途任何一个 <code>return</code> 都不会置 true。这是刻意的，宁可继续阻塞请求，也不能用残缺的数据做决策。
+        <br>这个模式叫「<strong>就绪标志放在初始化的最后一步</strong>」，
+        跟 Go 里 <code>sync.Once</code>、双检锁的道理是一样的。
+      </p>
+    </div>
+
+    <h2>5. 选主：为什么 follower 什么都不做</h2>
+
+    <div class="codeblock" data-file="pkg/scheduler/scheduler.go" data-start="414" data-lang="go" data-hl="1-3,5-10">
+<pre><code>	if config.LeaderElect {
+		leaseInformerFactory := informers.NewSharedInformerFactoryWithOptions(s.kubeClient, defaultResync, informers.WithNamespace(config.LeaderElectResourceNamespace))
+		s.leaseLister = leaseInformerFactory.Coordination().V1().Leases().Lister()
+
+		leaseEventHandlerRegistration, err := leaseInformerFactory.Coordination().V1().Leases().Informer().AddEventHandler(s.leaderManager)
+		if err != nil {
+			return fmt.Errorf("failed to register lease event handler: %w", err)
+		}
+		leaseInformerFactory.Start(s.stopCh)
+		leaseInformerFactory.WaitForCacheSync(s.stopCh)
+		cache.WaitForCacheSync(s.stopCh, leaseEventHandlerRegistration.HasSynced)
+	}</code></pre>
+    </div>
+
+    <div class="note">
+      <div class="t">为什么需要选主</div>
+      <p>
+        HAMi 调度器可以部署多副本做 HA。但 <code>register()</code> 会
+        往 Node 注解写 handshake（第 01 章的「点名」）。
+        如果多个副本同时点名，就会互相覆盖，导致 handshake 状态机错乱，
+        节点被误判为掉线。
+      </p>
+      <p style="margin-bottom:0">
+        所以：只有 leader 做 register（写注解），follower 只保持待命。
+        <br>注意 <code>/filter</code> 和 <code>/bind</code> <strong>不受选主限制</strong>。因为 kube-scheduler 通过 Service 访问扩展器，
+        请求可能落到任何一个副本上。这就是为什么<strong>节点锁必须是集群级的分布式锁</strong>，
+        而不能只靠进程内 mutex。
+      </p>
+    </div>
+
+    <p>Leader 状态用 <code>coordination.k8s.io/Lease</code> 实现，判断逻辑：</p>
+
+    <div class="codeblock" data-file="pkg/util/leaderelection/leaderelection.go" data-start="164" data-lang="go" data-hl="1,5-7,9-11">
+<pre><code>func (m *leaderManager) isHolderOf(lease *coordinationv1.Lease) bool {
+	...
+}
+
+func (m *leaderManager) isLeaseValid(now time.Time) bool {
+	if m.observedLease == nil || m.observedLease.Spec.LeaseDurationSeconds == nil {
+		return false
+	}
+	return m.observedTime.Add(time.Second * time.Duration(*m.observedLease.Spec.LeaseDurationSeconds)).After(now)
+}</code></pre>
+    </div>
+
+    <div class="note warn">
+      <div class="t">注意这里的 <code>observedTime</code> 是<b>本地</b>观察时间</div>
+      <p style="margin-bottom:0">
+        判断租约是否有效用的是「我什么时候看到这个 Lease 的」+ 租约时长，
+        而不是 Lease 对象里的 <code>renewTime</code>。
+        <br>这是<strong>刻意的</strong>：跨节点的系统时钟可能有偏差，
+        用本地单调时间更安全。（第 01 章的 handshake 也有同样的时钟问题，
+        但那里用的是墙上时间，是一个相对薄弱的点。）
+      </p>
+    </div>
+
+    <h2>6. 节点删除：一次五连清理</h2>
+
+    <div class="codeblock" data-file="pkg/scheduler/scheduler.go" data-start="281" data-lang="go" data-hl="2-3,24,25,26,28-34">
+<pre><code>func (s *Scheduler) onDelNode(obj any) {
+	// Ensure downstream consumers are notified regardless of decoding success
+	defer s.doNodeNotify()                           // ① 不管成不成功都通知 register 循环
+
+	var nodeName string
+	switch t := obj.(type) {
+	case *corev1.Node:
+		nodeName = t.Name
+		klog.V(4).InfoS("Node deleted, cleaning up nodelock", "node", nodeName)
+	case cache.DeletedFinalStateUnknown:             // ← tombstone！
+		if n, ok := t.Obj.(*corev1.Node); ok {
+			nodeName = n.Name
+			klog.V(4).InfoS("Node tombstone deleted, cleaning up nodelock", "node", nodeName)
+		} else {
+			klog.V(5).InfoS("Received tombstone for non-node object on delete")
+			return
+		}
+	default:
+		klog.V(5).InfoS("Received unknown object type on node delete")
+		return
+	}
+
+	nodelockutil.CleanupNodeLock(nodeName)           // ② 清进程内的每节点 mutex（防内存泄漏）
+	s.rmNode(nodeName)                               // ③ 清 nodeManager 里的设备清单
+	s.cleanupNodeUsage(nodeName)                     // ④ 清 overviewstatus（否则指标一直报废弃节点）
+	// Clear per-device health bookkeeping for the deleted node.
+	// Devices that track per-node state (e.g. NvidiaGPUDevices) implement
+	// NodeDeleted to prune their internal maps; others are a no-op.
+	for _, devInstance := range device.GetDevices() {
+		if nd, ok := devInstance.(*nvidia.NvidiaGPUDevices); ok {
+			nd.NodeDeleted(nodeName)                 // ⑤ 清各后端自己的每节点缓存
+		}
+	}
+}</code></pre>
+    </div>
+
+    <div class="note trap">
+      <div class="t"><code>cache.DeletedFinalStateUnknown</code>（墓碑）—— 必须处理</div>
+      <p style="margin-bottom:0">
+        当 informer 和 apiserver 的连接断开又重连时，中间发生的删除事件<strong>拿不到原始对象</strong>，
+        client-go 会包一个 <code>DeletedFinalStateUnknown</code>「墓碑」给你。
+        <br>不处理这个 case，节点删除时缓存就清不干净。调度器会一直认为那台机器还在，把 Pod 调度过去然后永远 Pending。
+        <br><em>每个 DeleteFunc 都必须有这个 switch。这是审查 controller 代码时的必查项。</em>
+      </p>
+    </div>
+
+    <div class="note warn">
+      <div class="t">第 ⑤ 步有个类型断言，这是个可以改进的点</div>
+      <p style="margin-bottom:0">
+        <code>if nd, ok := devInstance.(*nvidia.NvidiaGPUDevices); ok</code>。这里<strong>硬编码了 NVIDIA 类型</strong>。注释说「其他后端是 no-op」，
+        但如果将来有别的后端也需要清理每节点状态，就得改这里。
+        <br>更好的做法是<strong>定义一个可选接口</strong>（就像第 05 章的 <code>policyNeutralScorer</code>）：
+      </p>
+      <div class="codeblock" data-lang="go" data-title="改进思路">
+<pre><code>type nodeDeletedNotifier interface{ NodeDeleted(nodeName string) }
+
+if nd, ok := devInstance.(nodeDeletedNotifier); ok {
+	nd.NodeDeleted(nodeName)
+}</code></pre>
+      </div>
+      <p style="margin-bottom:0">
+        <em>这是一个<strong>范围小、价值明确、不改行为</strong>的重构 —— 非常适合做第一个 PR。</em>
+      </p>
+    </div>
+
+    <h2>7. 三类最容易踩的并发坑</h2>
+
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:110px">坑</th><th style="width:200px">症状</th><th>在 HAMi 里的防御</th></tr>
+      <tr>
+        <td><b>超卖</b></td>
+        <td>分配的显存总和超过物理容量，容器启动后 CUDA OOM</td>
+        <td>节点锁 + Filter 的 <code>TakeAndDeletePod</code> + informer 回调的 terminating 处理</td>
+      </tr>
+      <tr>
+        <td><b>资源泄漏</b></td>
+        <td>集群明明空着却调度不上去；<code>overviewstatus</code> 里有幽灵占用</td>
+        <td><code>cleanupStalePodAllocation</code>、<code>onDelPod</code>、<code>onDelNode</code> 五连清理、15 秒全量对账</td>
+      </tr>
+      <tr>
+        <td><b>数据竞争</b></td>
+        <td><code>-race</code> 报警；偶发的 map 并发读写 panic</td>
+        <td><code>scoreNode</code> 一进去就 DeepCopy；所有共享 map 都有锁；专门的 race 测试</td>
+      </tr>
+    </table>
+    </div>
+
+    <h2>8. 动手实验</h2>
+
+    <ol class="steps">
+      <li>
+        <span class="st">跑竞态检测（这是 CI 必过项）</span>
+        <div class="codeblock" data-lang="bash"><pre><code>go test ./pkg/scheduler/ -race -count=3
+go test ./pkg/... -short -race -count=1</code></pre></div>
+      </li>
+      <li>
+        <span class="st">看专门为并发写的测试</span>
+        <div class="codeblock" data-lang="bash"><pre><code>cat pkg/scheduler/register_race_test.go        # 125 行，专门测 register 的竞态
+go test ./pkg/scheduler/ -run TestRegisterRace -race -count=10 -v</code></pre></div>
+      </li>
+      <li>
+        <span class="st">故意制造一个竞态，看 race detector 怎么报</span>
+        <p>在 <code>scoreNode</code>（<code>score.go:364</code>）里把
+           <code>appNodeCopy := node.DeepCopy()</code> 改成 <code>appNodeCopy := node</code>，
+           然后跑：</p>
+        <div class="codeblock" data-lang="bash"><pre><code>go test ./pkg/scheduler/ -run Test_calcScore -race -count=1
+# 应该会看到 WARNING: DATA RACE
+git checkout pkg/scheduler/score.go   # 记得改回来</code></pre></div>
+        <p style="font-size:13.5px;color:var(--fg-soft)">
+          这个实验最能说明 DeepCopy 的必要性。
+        </p>
+      </li>
+      <li>
+        <span class="st">读 Pod 生命周期相关的测试</span>
+        <div class="codeblock" data-lang="bash"><pre><code>cat pkg/scheduler/scheduler_pod_lifecycle_test.go
+go test ./pkg/scheduler/ -run "PodLifecycle" -v -count=1</code></pre></div>
+      </li>
+      <li>
+        <span class="st">检查所有 DeleteFunc 是否都处理了墓碑</span>
+        <div class="codeblock" data-lang="bash"><pre><code>grep -rn "DeletedFinalStateUnknown" pkg/ --include=*.go | grep -v _test
+# 对比：一共注册了几个 DeleteFunc？
+grep -rn "DeleteFunc:" pkg/ --include=*.go | grep -v _test</code></pre></div>
+        <p style="font-size:13.5px;color:var(--fg-soft)">
+          如果数量对不上，你可能就找到了一个真实的 bug。
+        </p>
+      </li>
+    </ol>
+
+    <h2>9. 本章自测</h2>
+
+    <div class="quiz" data-answer="B">
+      <div class="q">调度器重启后，informer 把一个「正在删除中」的 GPU Pod 当作 add 事件重放。如果 <code>onAddPod</code> 直接 return，会发生什么？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>没影响，Pod 马上就要删了</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>这个 Pod 占的显存统计不到，其他 Pod 会被分配到同一份显存 → 超卖 → CUDA OOM</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>调度器会 panic</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>Pod 会被重新调度</span></div>
+      <div class="expl">
+        Pod 有了 DeletionTimestamp 之后，容器<strong>还在运行</strong>，
+        GPU 显存还被真实占用着。如果账本里没有它，
+        <code>getNodesUsage</code> 算出来的「已用」就偏小，
+        新 Pod 会被分配到同一份显存上，两个进程抢同一块显存 → CUDA OOM。
+        <br>所以代码里那个 <code>if _, cached := s.podManager.GetPod(pod); cached</code> 判断很关键：
+        缓存里有就只刷新，没有就落到正常记账路径。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="A">
+      <div class="q">为什么 <code>s.synced.Store(true)</code> 一定要放在 <code>register()</code> 的最后一行？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>提前置 true 会让 filter 请求用残缺的缓存做决策，把有 GPU 的节点误判为无 GPU</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>Go 的编译器要求</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>为了让日志顺序好看</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>为了释放锁</span></div>
+      <div class="expl">
+        HTTP 层的 <code>WaitForCacheSync</code> 就等这个标志。
+        <code>register()</code> 中间有多个 <code>return</code>（不是 leader、列节点失败、算用量失败），
+        任何一条提前返回都不该让缓存被认为「就绪」。
+        <br>宁可继续阻塞请求（kube-scheduler 会重试），也不能用残缺数据把 Pod 误判为不可调度。
+        <br>这是「就绪标志放最后」的通用模式。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="C">
+      <div class="q">调度器部署了 3 个副本。哪些操作只有 leader 能做？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>全部操作，follower 完全空转</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>只有 /bind，/filter 所有副本都能处理</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>只有 <code>register()</code>（写 Node 的 handshake 注解），/filter 和 /bind 任何副本都可能处理</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>只有 webhook</span></div>
+      <div class="expl">
+        kube-scheduler 通过 Service 访问扩展器，请求会被负载均衡到任意副本，
+        所以 <code>/filter</code> 和 <code>/bind</code> <strong>无法限制在 leader</strong>。
+        <br>只有 <code>register()</code> 受限，因为它要写 Node 的 handshake 注解 ——
+        多个副本同时写会互相覆盖，让「点名答到」状态机错乱。
+        <br>正因为 filter/bind 可能在不同副本上执行，节点锁才必须是集群级的分布式锁
+        （Node 注解 + resourceVersion CAS），进程内 mutex 是不够的。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="D">
+      <div class="q"><code>onDelNode</code> 里的 <code>case cache.DeletedFinalStateUnknown</code> 分支不写会怎样？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>编译不过</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>没影响，正常删除总会走 <code>*corev1.Node</code> 分支</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>只是日志少一行</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>informer 断线重连期间发生的节点删除会漏掉，缓存永远清不干净，调度器把 Pod 调到不存在的节点上</span></div>
+      <div class="expl">
+        当 informer 与 apiserver 的 watch 连接断开又重连时，
+        断开期间的删除事件<strong>拿不到原始对象</strong>，client-go 会包一个墓碑
+        （<code>DeletedFinalStateUnknown</code>）投递过来。
+        <br>不处理它，<code>nodeName</code> 就是空字符串，五连清理全部失效：
+        节点锁泄漏、设备清单残留、<code>overviewstatus</code> 里有幽灵节点。
+        <br>这是 K8s controller 代码审查的必查项，
+        HAMi 的 <code>onDelPod</code> 也有同样的 switch。
+      </div>
+    </div>
+
+    <h2>10. 小结</h2>
+
+    <ul>
+      <li>三个并发实体：<b>informer 事件循环</b>、15 秒 register 巡检、<b>HTTP 请求处理</b>，共享 podManager 和 overviewstatus。</li>
+      <li>锁的分工：<code>lock</code> 保护 overviewstatus，<code>allocLock</code> 保护预留账本的三条修改路径，
+          <code>nodeLocks</code> 保护单节点注解读改写，注解锁做跨进程互斥。</li>
+      <li>terminating 的 Pod 仍占卡，informer 重放时必须记账，否则超卖。</li>
+      <li>InitContainer 跑完要收缩用量，把多预留的显存还回去，用幂等标志保证只做一次。</li>
+      <li><code>synced</code> 放在初始化最后一行；任何中途 return 都不置 true。</li>
+      <li>只有 leader 做 register，filter/bind 任何副本都可能执行 → 所以必须有分布式锁。</li>
+      <li>每个 DeleteFunc 都要处理 墓碑（DeletedFinalStateUnknown）。</li>
+      <li>事件驱动 + <b>定时全量对账</b>兜底，是 controller 的标准写法。</li>
+    </ul>
+
+    <p class="next-hint">调度器这一侧到此结束。下一章切换到<strong>节点上的设备插件</strong>。它怎么把「一张物理卡」上报成「10 张虚拟卡」，
+        又怎么把 Pod 注解翻译成容器里的环境变量。</p>
+
+    <div class="chapter-nav" id="chapterNav"></div>
+  </main>
+</div>
+
+<script src="../assets/js/site.js"></script>
+<script>
+/* ========== Pod 事件决策树 ========== */
+(function () {
+  const out = document.getElementById('evOut');
+  const t = document.getElementById('ev_type');
+  const st = document.getElementById('ev_state');
+
+  const R = {
+    add: {
+      noanno: [['dim','pod.Annotations["hami.io/vgpu-node"] 不存在'],
+               ['ok','return —— 这个 Pod 不是 HAMi 调度的，不关我事']],
+      terminated: [['ok','有 vgpu-node 注解'],
+               ['warn','util.IsPodInTerminatedState(pod) == true（Succeeded / Failed）'],
+               ['ok','podManager.TakeAndDeletePod(pod)  —— 从账本移除'],
+               ['ok','quotaManager.RmUsage(pod, pi.Devices) —— 释放配额'],
+               ['dim','容器已经退出，GPU 真正空出来了，可以还给别人。']],
+      terminating: [['ok','有 vgpu-node 注解'],
+               ['dim','不是 terminated 状态'],
+               ['warn','util.IsPodTerminating(pod) == true（DeletionTimestamp != nil）'],
+               ['ok','podManager.GetPod(pod) → <b>缓存里有</b>'],
+               ['ok','podManager.UpdatePod(pod) —— 只刷新对象，<b>保留记账</b>'],
+               ['ok','return'],
+               ['dim','关键：正在删除的 Pod 容器还在跑，GPU 还占着，'],
+               ['dim','   现在就释放资源会导致超卖。']],
+      notcached: [['ok','有 vgpu-node 注解'],
+               ['warn','IsPodTerminating == true，但 podManager.GetPod → <b>缓存里没有</b>'],
+               ['warn','→ <b>不 return</b>，继续往下走！'],
+               ['ok','DecodePodDevices(SupportDevices, annotations) 解析分配记录'],
+               ['ok','CollapseInitContainerUsage → effectiveDevices'],
+               ['ok','podManager.AddPod + quotaManager.AddUsage'],
+               ['dim','这是调度器重启后 informer 重放全量事件的场景。'],
+               ['dim','缓存是空的，如果 return 就会漏记 → 超卖。'],
+               ['dim','这个分支是修真实 bug 加上的，注释写得很清楚。']],
+      normal: [['ok','有 vgpu-node 注解'],
+               ['ok','不是 terminated，不是 terminating'],
+               ['ok','DecodePodDevices(SupportDevices, annotations)'],
+               ['dim','  注意用的是 SupportDevices（hami.io/vgpu-devices-<b>allocated</b>）'],
+               ['dim','  而不是 InRequestDevices（to-allocate，会被设备插件消费掉）'],
+               ['ok','CollapseInitContainerUsage(pod, rawDevices) —— init 峰值折叠'],
+               ['ok','podManager.AddPod → 返回 true 才 quotaManager.AddUsage'],
+               ['dim','AddPod 返回 false 表示已经记过了，避免重复记账。']],
+      initdone: [['dim','onAddPod 不处理「init 跑完」的收缩，那是 onUpdatePod 的活'],
+               ['ok','走正常路径记账']],
+    },
+    update: {
+      noanno: [['dim','没有 vgpu-node 注解'],['ok','return']],
+      terminated: [['warn','IsPodInTerminatedState → TakeAndDeletePod + RmUsage'],
+               ['dim','跟 onAddPod 完全一样的处理。']],
+      terminating: [['warn','IsPodTerminating == true，缓存里有'],
+               ['ok','podManager.UpdatePod(newPod) → return'],
+               ['dim','保留记账，只刷新对象。']],
+      notcached: [['warn','IsPodTerminating == true，但缓存里没有'],
+               ['ok','s.onAddPod(newPod) —— <b>直接复用 add 的逻辑</b>'],
+               ['dim','resync 场景。复用而不是复制代码，减少两边逻辑漂移的风险。']],
+      normal: [['ok','有注解，不是 terminated/terminating'],
+               ['key','s.allocLock.Lock()  ← 跟 Filter / RefitNumaAllocation 同一把锁'],
+               ['ok','podManager.GetPod → 存在'],
+               ['ok','podManager.UpdatePod(newPod)'],
+               ['dim','检查 InitContainerResourceReleased：已释放过 → 什么都不做'],
+               ['key','s.allocLock.Unlock()（defer）']],
+      initdone: [['ok','有注解，正常状态'],
+               ['key','s.allocLock.Lock()'],
+               ['ok','podManager.UpdatePod(newPod)'],
+               ['warn','!pi.InitContainerResourceReleased && AllNonSidecarInitContainersSucceeded'],
+               ['ok','DecodePodDevices → SteadyStateDeviceUsage(newPod, rawDevices)'],
+               ['ok','podManager.UpdatePodDevice(newPod, steadyStateDevices)'],
+               ['ok','quotaManager.ReplaceUsage(newPod, oldDevices, steadyStateDevices)'],
+               ['dim','用量收缩：调度时按 max(init峰值, 普通容器) 预留，'],
+               ['dim','   比如 init 要 8000MB、普通容器要 3000MB → 预留了 8000MB。'],
+               ['dim','   init 跑完退出后，把多占的 5000MB 还回去给别人用。'],
+               ['dim','   InitContainerResourceReleased 保证只收缩一次（幂等）。']],
+    },
+    del: {
+      noanno: [['dim','onDelPod 先做 tombstone 解包（DeletedFinalStateUnknown）'],
+               ['dim','没有 vgpu-node 注解 → return']],
+      terminated: [['ok','TakeAndDeletePod + RmUsage —— 彻底释放']],
+      terminating: [['ok','TakeAndDeletePod + RmUsage'],
+               ['dim','Pod 对象真的被删除了，这时才是真正释放的时刻。']],
+      notcached: [['dim','缓存里本来就没有 → TakeAndDeletePod 返回 false → 无操作']],
+      normal: [['ok','TakeAndDeletePod + RmUsage'],
+               ['dim','这个回调必须处理 cache.DeletedFinalStateUnknown 墓碑，'],
+               ['dim','   否则 informer 断线重连期间的删除会漏掉 → 资源泄漏。']],
+      initdone: [['ok','TakeAndDeletePod + RmUsage']],
+    },
+  };
+  function run() {
+    const rows = R[t.value][st.value] || [['dim','（该组合无特殊处理）']];
+    const fn = { add: 'onAddPod  (scheduler.go:141)', update: 'onUpdatePod  (scheduler.go:183)', del: 'onDelPod  (scheduler.go:249)' }[t.value];
+    out.innerHTML = `<span class="key">${fn}</span>\n\n` + rows.map(([c, x]) =>
+      `<span class="${c}">${c === 'ok' ? '✓' : c === 'warn' ? '→' : c === 'key' ? '' : ' '}</span> <span class="${c === 'dim' ? 'dim' : c === 'key' ? 'key' : ''}">${x}</span>`).join('\n');
+  }
+  t.addEventListener('change', run);
+  st.addEventListener('change', run);
+  run();
+})();
+</script>
+</body>
+</html>

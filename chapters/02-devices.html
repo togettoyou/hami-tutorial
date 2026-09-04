@@ -1,0 +1,925 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · Devices 接口与数据结构 — HAMi 源码导读</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2316181d'/%3E%3Ctext x='16' y='23' font-size='17' font-family='monospace' font-weight='bold' fill='%23fff' text-anchor='middle'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main class="main">
+
+    <div class="page-kicker">第 02 章 · 第一阶段 打地基</div>
+    <h1 class="page-title">Devices 接口与核心数据结构</h1>
+    <p class="page-lede">
+      全项目只有<strong>一个</strong>核心抽象：15 个方法的 <code>Devices</code> 接口。
+      12 家硬件厂商各自实现它，调度器只跟接口打交道。
+      看懂这一章，你就知道「加一个新硬件」到底要写哪些代码。
+    </p>
+
+    <div class="goals">
+      <h3>学完这章你应该能</h3>
+      <ul>
+        <li>把 15 个接口方法按「生命周期阶段」正确归类，说出各自在什么时候被调用</li>
+        <li>分清 <code>DeviceInfo</code> / <code>DeviceUsage</code> / <code>ContainerDeviceRequest</code> / <code>ContainerDevice</code> 四个结构体的职责</li>
+        <li>解释 <code>PodDevices</code> 三层嵌套 map 的每一层是什么</li>
+        <li>说出「新增一个厂商设备后端」需要改哪几个文件</li>
+        <li>读懂最简单的 kunlun 后端全部 245 行代码</li>
+      </ul>
+    </div>
+
+    <h2>1. 一个接口撑起 12 家厂商</h2>
+
+    <div class="note analogy">
+      <div class="t">这个抽象换来了什么</div>
+      <p style="margin-bottom:0">
+        调度器全程只跟 <code>Devices</code> 接口打交道，不知道背后是哪家的硬件。
+        NVIDIA 的显存切分、寒武纪的 MLU、昇腾的 NPU，内部实现天差地别，
+        对调度器却是同一组方法。
+        <br>结果是：<strong>加一个新厂商，调度器一行代码都不用改</strong>。本章最后会具体列出要改哪几个文件。
+      </p>
+    </div>
+
+    <p>接口定义就在这里，一共 15 个方法：</p>
+
+    <div class="codeblock" data-file="pkg/device/devices.go" data-start="34" data-lang="go">
+<pre><code>type Devices interface {
+	CommonWord() string
+	MutateAdmission(ctr *corev1.Container, pod *corev1.Pod) (bool, error)
+	CheckHealth(devType string, n *corev1.Node) (bool, bool)
+	NodeCleanUp(nn string) error
+	GetResourceNames() ResourceNames
+	GetNodeDevices(n corev1.Node) ([]*DeviceInfo, error)
+	LockNode(n *corev1.Node, p *corev1.Pod) error
+	ReleaseNodeLock(n *corev1.Node, p *corev1.Pod) error
+	GenerateResourceRequests(ctr *corev1.Container) ContainerDeviceRequest
+	PatchAnnotations(pod *corev1.Pod, annoinput *map[string]string, pd PodDevices) map[string]string
+	ScoreNode(node *corev1.Node, podDevices PodSingleDevice, previous []*DeviceUsage, policy string) float32
+	AddResourceUsage(pod *corev1.Pod, n *DeviceUsage, ctr *ContainerDevice) error
+	Fit(devices []*DeviceUsage, request ContainerDeviceRequest, pod *corev1.Pod, nodeInfo *NodeInfo, allocated *PodDevices) (bool, map[string]ContainerDevices, string)
+}</code></pre>
+    </div>
+
+    <p>
+      光看这 15 行会觉得杂乱无章。但只要按「一个 Pod 的生命周期」重排，
+      逻辑立刻就清晰了：
+    </p>
+
+    <div class="lab">
+      <header>15 个方法的调用时机<span class="badge">互动</span></header>
+      <div class="body">
+        <p style="font-size:13.5px;color:var(--fg-soft);margin-bottom:12px">
+          点任意一个方法，看它在什么时候被谁调用、干什么、返回什么。
+        </p>
+        <div id="methodMap"></div>
+        <div class="out" id="methodOut">点上面任意一个方法</div>
+      </div>
+    </div>
+
+    <h3>按阶段速览</h3>
+
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:120px">阶段</th><th style="width:110px">谁在调</th><th>方法</th></tr>
+      <tr>
+        <td><b>① 启动注册</b></td><td>调度器启动时</td>
+        <td><code>CommonWord()</code> · <code>GetResourceNames()</code></td>
+      </tr>
+      <tr>
+        <td><b>② 节点巡检</b><br><span style="font-weight:400;color:var(--fg-mute);font-size:12px">每 15 秒一轮</span></td><td>调度器 register 循环</td>
+        <td><code>CheckHealth()</code> · <code>GetNodeDevices()</code> · <code>NodeCleanUp()</code></td>
+      </tr>
+      <tr>
+        <td><b>③ 准入</b></td><td>MutatingWebhook</td>
+        <td><code>MutateAdmission()</code></td>
+      </tr>
+      <tr>
+        <td><b>④ 调度打分</b><br><span style="font-weight:400;color:var(--fg-mute);font-size:12px">最核心</span></td><td>Filter 请求</td>
+        <td><code>GenerateResourceRequests()</code> · <b><code>Fit()</code></b> · <code>AddResourceUsage()</code> · <code>ScoreNode()</code></td>
+      </tr>
+      <tr>
+        <td><b>⑤ 写决策</b></td><td>Filter 收尾</td>
+        <td><code>PatchAnnotations()</code></td>
+      </tr>
+      <tr>
+        <td><b>⑥ 绑定</b></td><td>Bind 请求</td>
+        <td><code>LockNode()</code> · <code>ReleaseNodeLock()</code></td>
+      </tr>
+    </table>
+    </div>
+
+    <h2>2. 四个核心结构体：同一张卡的四副面孔</h2>
+
+    <p>
+      初学者最容易晕的地方：同一张 GPU，在代码里有四种不同的表示。
+      搞清楚它们的区别，代码就通了一大半。
+    </p>
+
+    <div class="note analogy">
+      <div class="t">四者的分工</div>
+      <ul style="margin-bottom:0">
+        <li><b>DeviceInfo</b> = <b>房产证</b>。静态属性：多大面积、几室几厅、在哪一层。不会变。</li>
+        <li><b>DeviceUsage</b> = <b>入住登记表</b>。动态状态：现在住了几个人、占了多少面积、还剩多少。<strong>调度时不断被修改</strong>。</li>
+        <li>ContainerDeviceRequest = <b>租房需求单</b>。"我要 1 间、至少 3000 平、朝南"。</li>
+        <li>ContainerDevice = <b>签好的租约</b>。"你住 A 栋 302，租 3000 平，用 30% 公共设施"。</li>
+      </ul>
+    </div>
+
+    <div class="lab">
+      <header>四副面孔转换器<span class="badge">互动</span></header>
+      <div class="body">
+        <p style="font-size:13.5px;color:var(--fg-soft);margin-bottom:12px">
+          调整下面的参数，看同一张 GPU 在四个结构体里分别长什么样、数据从哪来、到哪去。
+        </p>
+        <div class="field-row">
+          <div><label class="f">显存总量 MB</label><input type="number" id="fTotalMem" value="32768"></div>
+          <div><label class="f">已用显存 MB</label><input type="number" id="fUsedMem" value="8000"></div>
+          <div><label class="f">已用算力 %</label><input type="number" id="fUsedCore" value="40"></div>
+          <div><label class="f">已用份数</label><input type="number" id="fUsed" value="2"></div>
+          <div><label class="f">请求显存 MB</label><input type="number" id="fReqMem" value="3000"></div>
+          <div><label class="f">请求算力 %</label><input type="number" id="fReqCore" value="30"></div>
+        </div>
+        <div class="out" id="faceOut"></div>
+      </div>
+    </div>
+
+    <h3>2.1 DeviceInfo：静态能力（房产证）</h3>
+
+    <div class="codeblock" data-file="pkg/device/devices.go" data-start="127" data-lang="go" data-hl="2-9">
+<pre><code>type DeviceInfo struct {
+	ID           string         `json:"id,omitempty"`            // GPU UUID
+	Index        uint           `json:"index,omitempty"`         // 卡序号
+	Count        int32          `json:"count,omitempty"`         // 最多切几份
+	Devmem       int32          `json:"devmem,omitempty"`        // 显存总量 MB
+	Devcore      int32          `json:"devcore,omitempty"`       // 算力总量（恒 100）
+	Type         string         `json:"type,omitempty"`          // 型号
+	Numa         int            `json:"numa,omitempty"`          // NUMA 节点
+	Mode         string         `json:"mode,omitempty"`          // hami-core / mig / mps
+	MIGProfiles  []MigProfile   `json:"migProfiles,omitempty"`
+	MIGTemplate  []Geometry     `json:"migtemplate,omitempty"`   // Deprecated.
+	Health       bool           `json:"health,omitempty"`
+	DeviceVendor string         `json:"devicevendor,omitempty"`  // 哪家厂商，register 时填
+	CustomInfo   map[string]any `json:"custominfo,omitempty"`    // 厂商私有扩展
+	// Device pair scores use a dedicated node annotation and must not inflate
+	// the per-device registration payload.
+	DevicePairScore DevicePairScore `json:"-"`
+}</code></pre>
+    </div>
+
+    <p>
+      <strong>它从哪来？</strong>。从上一章讲的 Node 注解解析出来。
+      注意 NVIDIA 用的是 JSON 版本（因为要带 MIG placement）：
+    </p>
+
+    <div class="codeblock" data-file="pkg/device/nvidia/device.go" data-start="289" data-lang="go" data-hl="2-6,15-17,19-20">
+<pre><code>func (dev *NvidiaGPUDevices) GetNodeDevices(n corev1.Node) ([]*device.DeviceInfo, error) {
+	devEncoded, ok := n.Annotations[RegisterAnnos]              // hami.io/node-nvidia-register
+	if !ok {
+		return []*device.DeviceInfo{}, errors.New("annos not found " + RegisterAnnos)
+	}
+	nodedevices, err := device.UnMarshalNodeDevices(devEncoded) // JSON 反序列化
+	if err != nil {
+		klog.ErrorS(err, "failed to decode node devices", "node", n.Name, ...)
+		return []*device.DeviceInfo{}, err
+	}
+	if len(nodedevices) == 0 {
+		klog.InfoS("no nvidia gpu device found", "node", n.Name, ...)
+		return []*device.DeviceInfo{}, errors.New("no gpu found on node")
+	}
+	for idx := range nodedevices {
+		nodedevices[idx].DeviceVendor = dev.CommonWord()        // 打上厂商标签
+	}
+	// 再从另一条注解读 NVLink 拓扑分数，挂到对应的卡上
+	pairScores, ok := n.Annotations[RegisterGPUPairScore]       // hami.io/node-nvidia-score
+	...
+}</code></pre>
+    </div>
+
+    <h3>2.2 DeviceUsage：动态用量（入住登记表）</h3>
+
+    <p>
+      这是调度过程中被反复修改的那个结构体，也是整个打分算法的操作对象：
+    </p>
+
+    <div class="codeblock" data-file="pkg/device/devices.go" data-start="106" data-lang="go" data-hl="2-9">
+<pre><code>type DeviceUsage struct {
+	ID                  string
+	Index               uint
+	Used                int32     // ← 已经被几个容器用了（跟 Count 比）
+	Count               int32     // ← 最多能被几个容器用
+	Usedmem             int32     // ← 已用显存（跟 Totalmem 比）
+	Totalmem            int32
+	Totalcore           int32
+	Usedcores           int32     // ← 已用算力（跟 Totalcore 比）
+	Mode                string
+	MigProfiles         []MigProfile
+	MigAllocationsInUse []MigAllocation
+	MigTemplate         []Geometry // Deprecated: unused by dynamic NVIDIA MIG.
+	MigUsage            MigInUse   // Deprecated: unused by dynamic NVIDIA MIG.
+	Numa                int
+	Type                string
+	Health              bool
+	PodInfos            []*PodInfo
+	CustomInfo          map[string]any
+}</code></pre>
+    </div>
+
+    <div class="note">
+      <div class="t">三条「余量」公式，记住它们</div>
+      <p style="margin-bottom:0">
+        整个 <code>Fit()</code> 的十几个判断，本质上就是围绕这三条：
+      </p>
+      <div class="codeblock" data-lang="go" data-title="Fit 的三条底线">
+<pre><code>剩余份数 = Count     - Used          // 份数用完 → CardTimeSlicingExhausted
+剩余显存 = Totalmem  - Usedmem       // 显存不够 → CardInsufficientMemory
+剩余算力 = Totalcore - Usedcores     // 算力不够 → CardInsufficientCore</code></pre>
+      </div>
+    </div>
+
+    <div class="note trap">
+      <div class="t">踩坑：DeviceUsage 是<b>会被就地修改</b>的</div>
+      <p style="margin-bottom:0">
+        打分时，调度器会<strong>假装把 Pod 放上去</strong>（调 <code>AddResourceUsage</code> 扣减余量），
+        再看放完之后节点得多少分。所以每个节点打分前都必须先 <code>DeepCopy()</code>，
+        否则一个节点的试算会污染另一个节点的数据。
+        <br>这就是为什么 <code>DeviceUsage</code> 有一个 50 行的手写
+        <span data-srcref="pkg/device/devices.go:259"></span> <code>DeepCopy()</code>。
+        <br><em>第 05 章会看到这个 DeepCopy 在打分主循环里的确切位置。</em>
+      </p>
+    </div>
+
+    <h3>2.3 ContainerDeviceRequest：需求（租房需求单）</h3>
+
+    <div class="codeblock" data-file="pkg/device/devices.go" data-start="222" data-lang="go">
+<pre><code>type ContainerDeviceRequest struct {
+	Nums             int32   // 要几张卡
+	Type             string  // 要哪家的（"NVIDIA" / "MLU" / ...）
+	Memreq           int32   // 要多少显存（MB，绝对值）
+	MemPercentagereq int32   // 要多少显存（百分比）—— 101 是「未设置」哨兵值
+	Coresreq         int32   // 要多少算力（0-100）
+}</code></pre>
+    </div>
+
+    <div class="note warn">
+      <div class="t"><code>MemPercentagereq = 101</code> 是什么鬼</div>
+      <p style="margin-bottom:0">
+        Go 的 <code>int32</code> 零值是 0，但「显存要 0%」和「没设置显存百分比」是两回事。
+        于是代码用 <strong>101</strong>（一个不可能的百分比）当「未设置」的哨兵值。
+        在 <code>Fit()</code> 里你会看到 <code>if k.MemPercentagereq != 101 &amp;&amp; k.Memreq == 0</code>
+        这种判断，就是在区分这两种情况。
+        <br><em>这是典型的「用魔数当 Optional」，不够优雅但很常见 —— 读代码时看到 101 就知道是它。</em>
+      </p>
+    </div>
+
+    <p>它是从容器的 <code>resources.limits</code> 翻译过来的：</p>
+
+    <div class="codeblock" data-lang="yaml" data-title="用户写的 YAML">
+<pre><code>resources:
+  limits:
+    nvidia.com/gpu: 2          # → Nums = 2
+    nvidia.com/gpumem: 3000    # → Memreq = 3000, MemPercentagereq = 101
+    nvidia.com/gpucores: 30    # → Coresreq = 30</code></pre>
+    </div>
+
+    <p>
+      翻译逻辑在 <code>GenerateResourceRequests()</code> 里，
+      每家厂商的资源名不同，所以这是接口方法。NVIDIA 的实现有 88 行，
+      主要在处理各种边界情况（超范围、负数、百分比和绝对值同时给了怎么办）：
+    </p>
+
+    <div class="codeblock" data-file="pkg/device/nvidia/device.go" data-start="528" data-lang="go" data-hl="6-9,11-13,38-41,43-49">
+<pre><code>func (dev *NvidiaGPUDevices) GenerateResourceRequests(ctr *corev1.Container) device.ContainerDeviceRequest {
+	resourceName := corev1.ResourceName(dev.config.ResourceCountName)          // nvidia.com/gpu
+	resourceMem := corev1.ResourceName(dev.config.ResourceMemoryName)          // nvidia.com/gpumem
+	resourceMemPercentage := corev1.ResourceName(dev.config.ResourceMemoryPercentageName)
+	resourceCores := corev1.ResourceName(dev.config.ResourceCoreName)          // nvidia.com/gpucores
+	v, ok := ctr.Resources.Limits[resourceName]
+	if !ok {
+		v, ok = ctr.Resources.Requests[resourceName]      // limits 没有就看 requests
+	}
+	if ok {
+		if n, ok := v.AsInt64(); ok {
+			if n &lt;= 0 || n &gt; math.MaxInt32 {              // 卡数必须是正整数
+				klog.ErrorS(nil, "nvidia device count request is out of range", ...)
+				return device.ContainerDeviceRequest{}     // 返回零值 = 「这个容器不要 GPU」
+			}
+			memnum := 0
+			// ... 解析 gpumem，注意 MemoryFactor 缩放 ...
+			mempnum := int32(101)                          // ← 哨兵：未设置
+			// ... 解析 gpumem-percentage ...
+
+			if mempnum == 101 &amp;&amp; memnum == 0 {             // 两个都没写 → 用默认值
+				if dev.config.DefaultMemory != 0 {
+					memnum = int(dev.config.DefaultMemory)
+				} else {
+					mempnum = 100                          // 默认整卡显存
+				}
+			}
+			corenum := dev.config.DefaultCores
+			// ... 解析 gpucores ...
+			return device.ContainerDeviceRequest{
+				Nums:             int32(n),
+				Type:             NvidiaGPUDevice,
+				Memreq:           int32(memnum),
+				MemPercentagereq: mempnum,
+				Coresreq:         corenum,
+			}
+		}
+	}
+	return device.ContainerDeviceRequest{}                 // 零值 = 不要 GPU
+}</code></pre>
+    </div>
+
+    <h3>2.4 ContainerDevice：分配结果（签好的租约）</h3>
+
+    <div class="codeblock" data-file="pkg/device/devices.go" data-start="209" data-lang="go" data-hl="2-3,9-11">
+<pre><code>type ContainerDevice struct {
+	// TODO current Idx cannot use, because EncodeContainerDevices method not encode this filed.
+	Idx       int         // ← 注意这个 TODO：Idx 没被编码进注解，所以设备插件收不到
+	UUID      string
+	Type      string
+	Usedmem   int32
+	Usedcores int32
+	// Slots is the number of concurrent tasks this collapsed entry represents on the device.
+	// Usage reconstruction adds it to DeviceUsage.Used; 0 (raw, uncollapsed entries) counts as 1.
+	Slots      int32
+	CustomInfo map[string]any
+}</code></pre>
+    </div>
+
+    <div class="note tip">
+      <div class="t">注意那个 TODO</div>
+      <p style="margin-bottom:0">
+        <code>Idx</code> 字段有个明确的 TODO：它<strong>没有被编码进注解</strong>
+        （上一章看到编码只写了 UUID、Type、Usedmem、Usedcores 四个字段）。
+        所以设备插件那边拿不到 <code>Idx</code>，只能靠 UUID 去反查。
+        <br><em>这种带 TODO 的地方是找贡献切入口的好去处 —— 但改它要动注解格式，属于破坏性变更，
+        需要先在社区开 issue 讨论兼容方案。</em>
+      </p>
+    </div>
+
+    <h2>3. 三层嵌套：从一张卡到一个 Pod</h2>
+
+    <p>四个结构体之上，还有三层容器类型。它们只是 <code>type X []Y</code> 的别名，但层次必须搞清：</p>
+
+    <div class="codeblock" data-file="pkg/device/devices.go" data-start="230" data-lang="go" data-hl="1,4,5,6">
+<pre><code>type ContainerDevices []ContainerDevice              // ① 一个容器用的所有卡
+type ContainerDeviceRequests map[string]ContainerDeviceRequest
+
+// type ContainerAllDevices map[string]ContainerDevices.
+type PodSingleDevice []ContainerDevices             // ② 一个 Pod 的所有容器（同一种硬件）
+type PodDeviceRequests []ContainerDeviceRequests
+type PodDevices map[string]PodSingleDevice          // ③ 一个 Pod 的所有硬件类型</code></pre>
+    </div>
+
+    <div class="lab">
+      <header>三层结构可视化<span class="badge">互动</span></header>
+      <div class="body">
+        <p style="font-size:13.5px;color:var(--fg-soft);margin-bottom:12px">
+          一个同时用了 NVIDIA GPU 和寒武纪 MLU 的 Pod，它的 <code>PodDevices</code> 长这样。点击展开每一层。
+        </p>
+        <div id="layerViz"></div>
+      </div>
+    </div>
+
+    <p>用一句话记住：</p>
+
+    <div class="codeblock" data-lang="go" data-title="三层的对应关系">
+<pre><code>PodDevices["NVIDIA"]          → PodSingleDevice   // 这个 Pod 用的所有 NVIDIA 卡
+PodDevices["NVIDIA"][0]       → ContainerDevices  // 第 0 个容器用的 NVIDIA 卡
+PodDevices["NVIDIA"][0][1]    → ContainerDevice   // 第 0 个容器的第 1 张卡</code></pre>
+    </div>
+
+    <div class="note warn">
+      <div class="t">索引 <code>[0]</code> 是「第几个容器」，包含 InitContainer</div>
+      <p style="margin-bottom:0">
+        <code>PodSingleDevice</code> 的下标不是「第几张卡」，是<strong>容器序号</strong>。
+        而且顺序是：先所有 InitContainer，再所有普通 Container。
+        看 <code>Resourcereqs()</code> 就明白了：
+      </p>
+    </div>
+
+    <div class="codeblock" data-file="pkg/device/devices.go" data-start="656" data-lang="go" data-hl="3-4,13,29-30,32">
+<pre><code>func Resourcereqs(pod *corev1.Pod) (counts PodDeviceRequests) {
+	// Total containers = init containers + regular containers
+	totalContainers := len(pod.Spec.InitContainers) + len(pod.Spec.Containers)
+	counts = make(PodDeviceRequests, totalContainers)
+	...
+	cnt := int32(0)
+
+	// Process init containers first (indices 0 to len(InitContainers)-1)
+	for i := range pod.Spec.InitContainers {
+		devices := GetDevices()
+		counts[i] = make(ContainerDeviceRequests)
+		...
+		for idx, val := range devices {                                  // 遍历每家厂商
+			request := val.GenerateResourceRequests(&amp;pod.Spec.InitContainers[i])
+			if request.Nums &gt; 0 {
+				cnt += request.Nums
+				counts[i][idx] = request                                 // counts[容器序号][厂商]
+			}
+		}
+	}
+
+	// Process regular containers (indices len(InitContainers) to totalContainers-1)
+	initContainerOffset := len(pod.Spec.InitContainers)
+	for i := range pod.Spec.Containers {
+		devices := GetDevices()
+		counts[initContainerOffset+i] = make(ContainerDeviceRequests)
+		...
+		for idx, val := range devices {
+			request := val.GenerateResourceRequests(&amp;pod.Spec.Containers[i])
+			if request.Nums &gt; 0 {
+				cnt += request.Nums
+				counts[initContainerOffset+i][idx] = request             // 加偏移量
+			}
+		}
+	}
+	...
+	return counts
+}</code></pre>
+    </div>
+
+    <h2>4. 全局注册表：DevicesMap</h2>
+
+    <p>
+      调度器怎么知道有哪些厂商？靠一个全局 map，在启动时一次性填满：
+    </p>
+
+    <div class="codeblock" data-file="pkg/device/devices.go" data-start="246" data-lang="go" data-hl="3-6">
+<pre><code>var (
+	GPUSchedulerPolicy string
+	InRequestDevices   map[string]string   // 厂商 → "待分配"注解 key
+	SupportDevices     map[string]string   // 厂商 → "已分配"注解 key
+	DevicesMap         map[string]Devices  // 厂商 → 接口实现  ← 最重要
+	DevicesToHandle    []string
+)</code></pre>
+    </div>
+
+    <p>填充发生在这里，一个厂商一个条目：</p>
+
+    <div class="codeblock" data-file="pkg/scheduler/config/config.go" data-start="99" data-lang="go" data-hl="6-8,12-25,28-36">
+<pre><code>func InitDevicesWithConfig(config *Config) error {
+	if err := validateConfig(config); err != nil {
+		klog.Errorf("Invalid configuration: %v", err)
+		return err
+	}
+	klog.Info("Initializing devices with configuration")
+
+	device.DevicesMap = make(map[string]device.Devices)
+	device.DevicesToHandle = []string{}
+	var initErrors []error
+
+	// Helper function to initialize devices and handle errors
+	initializeDevice := func(deviceType string, commonWord string, initFunc func(any) (device.Devices, error), config any) {
+		klog.Infof("Initializing %s device", commonWord)
+		dev, err := initFunc(config)
+		if err != nil {
+			klog.Errorf("Failed to initialize %s device: %v", commonWord, err)
+			initErrors = append(initErrors, fmt.Errorf("%s: %v", commonWord, err))
+			return
+		}
+		device.DevicesMap[dev.CommonWord()] = dev                  // ← 注册进全局表
+		device.DevicesToHandle = append(device.DevicesToHandle, commonWord)
+		klog.Infof("%s device initialized successfully", commonWord)
+	}
+
+	// Wrapper for each device's initialization function to include type assertion check
+	deviceInitializers := []struct {
+		deviceType string
+		commonWord string
+		initFunc   func(any) (device.Devices, error)
+		config     any
+	}{
+		{nvidia.NvidiaGPUDevice, nvidia.NvidiaGPUDevice, func(cfg any) (device.Devices, error) {
+			nvidiaConfig, ok := cfg.(nvidia.NvidiaConfig)
+			if !ok {
+				return nil, fmt.Errorf("invalid configuration for %s", nvidia.NvidiaGPUDevice)
+			}
+			return nvidia.InitNvidiaDevice(nvidiaConfig), nil
+		}, config.NvidiaConfig},
+		// ... 后面还有 cambricon / hygon / enflame / mthreads / metax / ascend / ...
+	}
+	...
+}</code></pre>
+    </div>
+
+    <p>之后所有地方都通过 <code>device.GetDevices()</code> 拿到这张表，遍历所有厂商：</p>
+
+    <div class="codeblock" data-file="pkg/device/devices.go" data-start="313" data-lang="go">
+<pre><code>func GetDevices() map[string]Devices {
+	return DevicesMap
+}</code></pre>
+    </div>
+
+    <div class="note trap">
+      <div class="t">踩坑：写单元测试时 DevicesMap 是空的</div>
+      <p style="margin-bottom:0">
+        <code>DevicesMap</code> 只在 <code>InitDevices()</code> 里填充。
+        如果你写一个测试直接调 <code>Resourcereqs(pod)</code>，
+        <strong>会得到空结果</strong>，因为 <code>GetDevices()</code> 返回空 map。
+        <br>解决办法：看 <span data-srcref="pkg/scheduler/score_test.go:42"></span> 的
+        <code>TestMain</code>，它在所有测试跑之前先手动初始化了一次。你的测试也要这么做。
+      </p>
+    </div>
+
+    <h2>5. 实战：读懂最简单的后端（kunlun，245 行）</h2>
+
+    <p>
+      NVIDIA 后端 1140 行太复杂，先拿百度昆仑（Kunlun XPU）练手 ——
+      它是所有后端里最简单的，因为<strong>它不支持切分，只能整卡分配</strong>。
+    </p>
+
+    <p>整个 <code>Fit()</code> 的核心判断只有一行：</p>
+
+    <div class="codeblock" data-file="pkg/device/kunlun/device.go" data-start="243" data-lang="go" data-hl="2">
+<pre><code>func FitXPU(device *device.DeviceUsage, request device.ContainerDeviceRequest) bool {
+	return device.Used == 0 &amp;&amp; device.Health          // 只要没被用过 + 健康，就能放
+}</code></pre>
+    </div>
+
+    <p>对比一下 NVIDIA 的 <code>Fit()</code>（第 05 章详讲）：</p>
+
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:180px"></th><th style="width:150px">kunlun</th><th>nvidia</th></tr>
+      <tr><td>能不能切分</td><td>不能，整卡</td><td>能，按显存 + 算力两个维度</td></tr>
+      <tr><td>判断条件数</td><td><b>2 个</b></td><td><b>14 个</b>（健康、cordon、型号、NUMA、UUID、份数、互斥、算力范围、配额、显存、算力、独占、算力耗尽、自定义规则）</td></tr>
+      <tr><td>拓扑感知</td><td>有（<code>graghSelect</code>）</td><td>有（NVLink pair score）</td></tr>
+      <tr><td>代码行数</td><td>245</td><td>1140</td></tr>
+    </table>
+    </div>
+
+    <p>kunlun 的 <code>Fit()</code> 全文（有删减）—— 建议对着源码通读一遍：</p>
+
+    <div class="codeblock" data-file="pkg/device/kunlun/device.go" data-start="187" data-lang="go" data-hl="6-18,20,31-42">
+<pre><code>func (kl *KunlunDevices) Fit(devices []*device.DeviceUsage, request device.ContainerDeviceRequest, pod *corev1.Pod, nodeInfo *device.NodeInfo, allocated *device.PodDevices) (bool, map[string]device.ContainerDevices, string) {
+	klog.InfoS("Allocating device for container request", "pod", klog.KObj(pod), "card request", request)
+	tmpDevs := make(map[string]device.ContainerDevices)
+	reason := make(map[string]int)
+
+	// graghSelect decides topology from the position of a device in the slice,
+	// so the uuid constraint has to be applied through fitFn rather than by
+	// filtering the slice first.
+	uuidMismatches := make(map[string]bool)
+	fitFn := func(d *device.DeviceUsage, r device.ContainerDeviceRequest) bool {
+		if !device.CheckUUID(pod.GetAnnotations(), d.ID, UseUUIDAnno, NoUseUUIDAnno, kl.CommonWord()) ||
+			!device.CheckUUID(pod.GetAnnotations(), d.ID, KunlunUseUUID, KunlunNoUseUUID, kl.CommonWord()) {
+			uuidMismatches[d.ID] = true
+			klog.V(5).InfoS(common.CardUUIDMismatch, "pod", klog.KObj(pod), "device", d.ID)
+			return false
+		}
+		return FitXPU(d, r)                                  // ← 唯一的资源判断
+	}
+
+	alloc := graghSelect(devices, request, fitFn)            // 拓扑感知的选卡
+	if len(alloc) == 0 {
+		uuidMismatch := len(uuidMismatches)
+		if uuidMismatch &gt; 0 {
+			reason[common.CardUUIDMismatch] += uuidMismatch
+		} else {
+			reason[common.NumaNotFit]++
+			klog.V(5).InfoS(common.NumaNotFit, "pod", klog.KObj(pod), ...)
+		}
+		return false, tmpDevs, common.GenReason(reason, len(devices))   // 失败要给原因
+	}
+
+	for _, dev := range alloc {
+		for _, val := range devices {
+			if val.Index == uint(dev) {
+				tmpDevs[request.Type] = append(tmpDevs[request.Type], device.ContainerDevice{
+					Idx:       int(val.Index),
+					UUID:      val.ID,
+					Type:      request.Type,
+					Usedmem:   val.Totalmem,               // ← 整卡：用满
+					Usedcores: val.Totalcore,              // ← 整卡：用满
+				})
+				break
+			}
+		}
+	}
+	return true, tmpDevs, ""
+}</code></pre>
+    </div>
+
+    <p>
+      注意最后那段：整卡分配时 <code>Usedmem = Totalmem</code>、<code>Usedcores = Totalcore</code>，
+      也就是「你拿走整张卡」。而 NVIDIA 会按请求填部分值 —— 这就是「能不能共享」在代码上的全部区别。
+    </p>
+
+    <h2>6. 新增一个硬件后端要改什么</h2>
+
+    <p>这是社区里很常见的需求，也是一个很好的贡献方向。清单如下：</p>
+
+    <ol class="steps">
+      <li>
+        <span class="st">新建 <code>pkg/device/&lt;厂商&gt;/device.go</code></span>
+        定义 <code>XxxDevices</code> 结构体，实现全部 15 个接口方法。
+        抄 <code>pkg/device/kunlun/</code> 起步最快。
+      </li>
+      <li>
+        <span class="st">定义常量：资源名和注解 key</span>
+        <code>XxxResourceCount = "vendor.com/xpu"</code>、
+        <code>RegisterAnnos = "hami.io/node-xxx-register"</code> 等。
+      </li>
+      <li>
+        <span class="st">在 <code>InitXxxDevice()</code> 里登记注解 key</span>
+        往 <code>device.InRequestDevices</code> / <code>SupportDevices</code> / <code>util.HandshakeAnnos</code> 三张表里各写一条。
+      </li>
+      <li>
+        <span class="st">注册到 <span data-srcref="pkg/scheduler/config/config.go:99"></span></span>
+        在 <code>deviceInitializers</code> 数组里加一项。
+      </li>
+      <li>
+        <span class="st">加配置结构体</span>
+        在 <code>Config</code> 里加 <code>XxxConfig</code> 字段，同时改 <code>charts/hami/</code> 里的 values 模板。
+      </li>
+      <li>
+        <span class="st">写测试 + 加 example</span>
+        参考 <code>pkg/device/kunlun/device_test.go</code>（747 行），
+        并在 <code>examples/&lt;厂商&gt;/</code> 放一个示例 YAML。
+      </li>
+    </ol>
+
+    <div class="note tip">
+      <div class="t">找一个真实的参考 PR</div>
+      <div class="codeblock" data-lang="bash">
+<pre><code># 看某个厂商后端是怎么一步步加进来的
+git log --oneline --diff-filter=A -- pkg/device/biren/
+git show --stat &lt;那个 commit&gt;</code></pre>
+      </div>
+    </div>
+
+    <h2>7. 动手实验</h2>
+
+    <ol class="steps">
+      <li>
+        <span class="st">列出所有 Fit 实现，直观感受「一个接口 N 个实现」</span>
+        <div class="codeblock" data-lang="bash"><pre><code>grep -rn ") Fit(" pkg/device/ --include=*.go | grep -v _test | wc -l   # 16 个（有的厂商有两种设备）
+grep -rn ") Fit(" pkg/device/ --include=*.go | grep -v _test</code></pre></div>
+      </li>
+      <li>
+        <span class="st">通读 kunlun 后端，跑它的测试</span>
+        <div class="codeblock" data-lang="bash"><pre><code>cat pkg/device/kunlun/device.go            # 245 行
+go test ./pkg/device/kunlun/ -v -count=1</code></pre></div>
+      </li>
+      <li>
+        <span class="st">验证「四副面孔」的转换</span>
+        <div class="codeblock" data-lang="bash"><pre><code># DeviceInfo 怎么变成 DeviceUsage？看这个函数（第 05 章会详讲）
+grep -n "func buildNodeUsage" -A 40 pkg/scheduler/scheduler.go</code></pre></div>
+      </li>
+      <li>
+        <span class="st">看 DeepCopy 为什么必须手写</span>
+        <div class="codeblock" data-lang="bash"><pre><code>sed -n '259,310p' pkg/device/devices.go
+# 思考：哪些字段是指针/切片/map？漏掉一个会导致什么后果？</code></pre></div>
+      </li>
+    </ol>
+
+    <h2>8. 本章自测</h2>
+
+    <div class="quiz" data-answer="B">
+      <div class="q"><code>PodDevices["NVIDIA"][2][0]</code> 指的是什么？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>第 2 张 NVIDIA 卡的第 0 个分片</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>第 2 个容器（含 InitContainer 计数）使用的第 0 张 NVIDIA 卡</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>第 2 个 NUMA 节点上的第 0 张卡</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>第 2 个 Pod 的第 0 张卡</span></div>
+      <div class="expl">
+        三层是：<code>[厂商] → [容器序号] → [该容器的第几张卡]</code>。
+        而且容器序号是先 InitContainer 后普通 Container连续编号的
+        （见 <code>Resourcereqs</code>，<code>devices.go:656</code>）。
+        如果 Pod 有 1 个 InitContainer，那么 <code>[2]</code> 对应的是<strong>第 2 个普通容器</strong>（下标 1）。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="C">
+      <div class="q"><code>MemPercentagereq</code> 的值是 <code>101</code> 时意味着什么？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>请求 101% 显存，超卖模式</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>参数非法，会被拒绝</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>哨兵值，表示「用户没设置显存百分比」</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>表示该容器不需要 GPU</span></div>
+      <div class="expl">
+        因为 <code>int32</code> 零值是 0，而「0%」是合法输入，
+        无法用 0 表示「未设置」。所以代码用 101 这个不可能的百分比当哨兵。
+        在 <code>Fit()</code> 里的判断 <code>if k.MemPercentagereq != 101 &amp;&amp; k.Memreq == 0</code>
+        意思是「用户给了百分比但没给绝对值，那就按百分比算」。
+        <br>「该容器不需要 GPU」是靠返回<strong>整个零值结构体</strong>（<code>Nums == 0</code>）表示的，不是靠 101。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="A">
+      <div class="q">为什么 <code>DeviceUsage</code> 需要一个 50 行的手写 <code>DeepCopy()</code>？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>打分时要在副本上「假装放置 Pod」试算，不能污染其他节点的真实数据</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>为了序列化成注解</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>Go 的赋值不能复制结构体</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>为了通过 race detector</span></div>
+      <div class="expl">
+        打分流程是：拷贝一份节点用量 → 在副本上调 <code>AddResourceUsage</code> 扣减余量 →
+        看扣完之后节点得多少分。多个节点是<strong>并发打分</strong>的（<code>calcScoreWithOptions</code> 里起了 goroutine），
+        如果共用同一份数据就会互相污染。
+        <br>手写而不用泛型/反射，是因为里面有 <code>MigProfiles</code>、<code>PodInfos</code>、<code>CustomInfo</code> 等
+        切片和 map 字段，浅拷贝会共享底层数组。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="D">
+      <div class="q">你要给一款新的国产 AI 芯片写 HAMi 支持。下面哪一步<strong>不需要</strong>做？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>实现 <code>Devices</code> 接口的全部 15 个方法</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>在 <code>InitDevicesWithConfig()</code> 的 <code>deviceInitializers</code> 里注册</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>往 <code>InRequestDevices</code> / <code>SupportDevices</code> 注册注解 key</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>修改 <code>pkg/scheduler/score.go</code> 的打分逻辑来支持新硬件</span></div>
+      <div class="expl">
+        这正是接口抽象的价值：调度器的打分主流程对硬件完全无感知。
+        <code>score.go</code> 只调 <code>devPlugin.Fit()</code> 和 <code>devPlugin.ScoreNode()</code>，
+        具体怎么筛卡、怎么打分由各后端自己决定。
+        加新硬件只需要 A、B、C 三步（外加配置结构体、Helm chart、测试和示例 YAML）。
+      </div>
+    </div>
+
+    <h2>9. 小结</h2>
+
+    <ul>
+      <li><code>Devices</code> 接口 15 个方法 = <b>「国标插座」</b>，12 家厂商各自实现，调度器只认接口。</li>
+      <li>按生命周期分六组：启动注册 → 节点巡检 → 准入 → 调度打分 → 写决策 → 绑定。</li>
+      <li>同一张卡四副面孔：<b>DeviceInfo</b>（房产证，静态）、<b>DeviceUsage</b>（登记表，动态、会被改）、
+          ContainerDeviceRequest（需求单）、ContainerDevice（租约）。</li>
+      <li>三层嵌套：<code>PodDevices[厂商][容器序号][第几张卡]</code>，容器序号<b>先 Init 后普通</b>。</li>
+      <li><code>DevicesMap</code> 全局注册表在 <code>InitDevicesWithConfig()</code> 一次性填满；
+          写测试记得先初始化，否则它是空的。</li>
+      <li>加新硬件 = 实现接口 + 注册，<b>不用改调度器一行代码</b>。</li>
+    </ul>
+
+    <p class="next-hint">地基打好了。从下一章开始进入主干 —— 跟着一个真实的 Pod 走完全流程。
+        第一站：它刚被 <code>kubectl apply</code> 提交，还没进调度器，
+        先被 MutatingWebhook 拦下来动了手脚。</p>
+
+    <div class="chapter-nav" id="chapterNav"></div>
+  </main>
+</div>
+
+<script src="../assets/js/site.js"></script>
+<script>
+/* ========== 实验室 1：15 个方法的调用时机 ========== */
+(function () {
+  const M = [
+    { n: 'CommonWord', stage: '① 启动', who: '各处',
+      d: '返回这个后端的短名，比如 "NVIDIA"。它是 DevicesMap 的 key，也是 PodDevices 第一层的 key。',
+      ret: 'string', src: 'pkg/device/nvidia/device.go:183' },
+    { n: 'GetResourceNames', stage: '① 启动', who: '配额检查 / 健康检查',
+      d: '返回这个后端认哪些 K8s 资源名，比如 nvidia.com/gpu、nvidia.com/gpumem、nvidia.com/gpucores。MemoryFactor 是显存单位换算系数。',
+      ret: 'ResourceNames', src: 'pkg/device/nvidia/device.go:1025' },
+    { n: 'CheckHealth', stage: '② 巡检', who: 'Scheduler.register()',
+      d: '握手检查。返回 (健康?, 需要更新?)。超时未答到且 Allocatable 也归零 → 返回 (false,false) 触发 NodeCleanUp。上一章讲过。',
+      ret: '(bool 健康, bool 需更新)', src: 'pkg/device/devices.go:593' },
+    { n: 'GetNodeDevices', stage: '② 巡检', who: 'Scheduler.register()',
+      d: '从 Node 注解解析出这台机器上的设备清单。返回 []*DeviceInfo（静态能力）。',
+      ret: '[]*DeviceInfo', src: 'pkg/device/nvidia/device.go:289' },
+    { n: 'NodeCleanUp', stage: '② 巡检', who: 'Scheduler.register()',
+      d: '节点判定掉线后调用，清理该后端在这个节点上的残留状态（比如缓存的上报记录）。',
+      ret: 'error', src: 'pkg/device/nvidia/device.go:230' },
+    { n: 'MutateAdmission', stage: '③ 准入', who: 'MutatingWebhook',
+      d: '在 Pod 被持久化之前修改它：校验参数合法性、注入环境变量、补默认值、设置 RuntimeClass。返回 (这个容器是否用了本厂商的资源, error)。第 03 章详讲。',
+      ret: '(bool 用到了?, error)', src: 'pkg/device/nvidia/device.go:334' },
+    { n: 'GenerateResourceRequests', stage: '④ 打分', who: 'Resourcereqs()',
+      d: '把容器的 resources.limits 翻译成 ContainerDeviceRequest。返回零值（Nums==0）表示「这个容器不用本厂商的设备」。',
+      ret: 'ContainerDeviceRequest', src: 'pkg/device/nvidia/device.go:528' },
+    { n: 'Fit', stage: '④ 打分', who: 'fitInDevices()',
+      d: '全项目最核心的方法。给定节点上这一类设备的当前用量 + 一个容器的需求，判断能不能放下，能的话返回具体用哪几张卡、每张扣多少。失败时返回人类可读的原因字符串（会写进 Pod event）。第 05 章整章讲它。',
+      ret: '(bool 能放?, map[string]ContainerDevices 方案, string 原因)', src: 'pkg/device/nvidia/device.go:853' },
+    { n: 'AddResourceUsage', stage: '④ 打分', who: 'fitInDevices()',
+      d: 'Fit 决定用某张卡之后，把这次分配「记账」到 DeviceUsage 上（Used++、Usedmem+=、Usedcores+=）。注意它改的是副本。',
+      ret: 'error', src: 'pkg/device/nvidia/device.go:779' },
+    { n: 'ScoreNode', stage: '④ 打分', who: 'NodeScore.OverrideScore()',
+      d: '在通用打分之外，给后端一个「加料」的机会。比如 NVIDIA 用它来给 NVLink 拓扑更好的组合加分。多数后端返回 0。',
+      ret: 'float32', src: 'pkg/device/nvidia/device.go:775' },
+    { n: 'PatchAnnotations', stage: '⑤ 写决策', who: 'Scheduler.Filter()',
+      d: '把分配结果编码成注解字符串，写进 Pod。同时写 to-allocate（会被消费）和 allocated（留档）两条。',
+      ret: 'map[string]string', src: 'pkg/device/nvidia/device.go:513' },
+    { n: 'LockNode', stage: '⑥ 绑定', who: 'Scheduler.acquireNodeLocks()',
+      d: '抢节点锁，防止多个 Pod 并发绑定到同一节点造成超卖。基于 Node 注解实现的分布式锁。第 07 章详讲。',
+      ret: 'error', src: 'pkg/device/nvidia/device.go:275' },
+    { n: 'ReleaseNodeLock', stage: '⑥ 绑定', who: 'Scheduler.releaseAllDevices()',
+      d: '释放节点锁。Bind 失败时的回滚路径也会调它。',
+      ret: 'error', src: 'pkg/device/nvidia/device.go:282' },
+  ];
+  const COLORS = { '① 启动': 'var(--blue)', '② 巡检': 'var(--violet)', '③ 准入': 'var(--amber)',
+                   '④ 打分': 'var(--accent)', '⑤ 写决策': 'var(--rose)', '⑥ 绑定': 'var(--blue)' };
+  const host = document.getElementById('methodMap');
+  const out = document.getElementById('methodOut');
+  host.innerHTML = '<div style="display:flex;flex-wrap:wrap;gap:7px">' + M.map((m, i) =>
+    `<button class="btn ghost" data-i="${i}" style="font-family:var(--mono);font-size:11.5px;padding:5px 11px;border-left:3px solid ${COLORS[m.stage]}">${m.n}</button>`
+  ).join('') + '</div>';
+  host.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+    const m = M[+b.dataset.i];
+    out.innerHTML =
+`<span class="key">${m.n}()</span>   <span class="dim">${m.stage} 阶段</span>
+
+<span class="dim">谁在调：</span>${m.who}
+<span class="dim">返回值：</span>${m.ret}
+
+${m.d}
+
+<span class="ok">${m.src}</span>`;
+  }));
+})();
+
+/* ========== 实验室 2：四副面孔 ========== */
+(function () {
+  const ids = ['fTotalMem','fUsedMem','fUsedCore','fUsed','fReqMem','fReqCore'];
+  const out = document.getElementById('faceOut');
+  function render() {
+    const v = {};
+    ids.forEach(id => v[id] = parseInt(document.getElementById(id).value, 10) || 0);
+    const freeMem  = v.fTotalMem - v.fUsedMem;
+    const freeCore = 100 - v.fUsedCore;
+    const freeSlot = 10 - v.fUsed;
+    const memOK  = freeMem  >= v.fReqMem;
+    const coreOK = freeCore >= v.fReqCore;
+    const slotOK = freeSlot > 0;
+    const fit = memOK && coreOK && slotOK;
+
+    out.innerHTML =
+`<span class="key">① DeviceInfo</span>  <span class="dim">← 静态，从 Node 注解解析而来，调度过程中不变</span>
+   { ID: "GPU-abc", Index: 0, Count: 10, Devmem: ${v.fTotalMem}, Devcore: 100,
+     Type: "NVIDIA-A100", Numa: 0, Health: true, Mode: "hami-core" }
+
+<span class="key">② DeviceUsage</span>  <span class="dim">← 动态，打分时在副本上被反复修改</span>
+   { ID: "GPU-abc", Count: 10, Used: ${v.fUsed},
+     Totalmem: ${v.fTotalMem}, Usedmem: ${v.fUsedMem},
+     Totalcore: 100,  Usedcores: ${v.fUsedCore} }
+
+   余量：份数 ${freeSlot}/10   显存 ${freeMem} MB   算力 ${freeCore}%
+
+<span class="key">③ ContainerDeviceRequest</span>  <span class="dim">← 从容器 resources.limits 翻译而来</span>
+   { Nums: 1, Type: "NVIDIA", Memreq: ${v.fReqMem}, MemPercentagereq: 101, Coresreq: ${v.fReqCore} }
+
+<span class="key">④ Fit() 逐条判断</span>
+   份数  ${slotOK ? '<span class="ok">✓</span>' : '<span class="bad">✗</span>'} Count(10) ${slotOK ? '>' : '<='} Used(${v.fUsed})${slotOK ? '' : '  → CardTimeSlicingExhausted'}
+   显存  ${memOK ? '<span class="ok">✓</span>' : '<span class="bad">✗</span>'} 剩 ${freeMem} ${memOK ? '>=' : '<'} 需 ${v.fReqMem}${memOK ? '' : '  → CardInsufficientMemory'}
+   算力  ${coreOK ? '<span class="ok">✓</span>' : '<span class="bad">✗</span>'} 剩 ${freeCore} ${coreOK ? '>=' : '<'} 需 ${v.fReqCore}${coreOK ? '' : '  → CardInsufficientCore'}
+
+` + (fit
+? `<span class="key">⑤ ContainerDevice</span>  <span class="dim">← Fit 成功，产出「租约」</span>
+   { Idx: 0, UUID: "GPU-abc", Type: "NVIDIA", Usedmem: ${v.fReqMem}, Usedcores: ${v.fReqCore} }
+
+<span class="key">⑥ AddResourceUsage 记账后的 DeviceUsage</span>
+   Used: ${v.fUsed} → <span class="ok">${v.fUsed+1}</span>   Usedmem: ${v.fUsedMem} → <span class="ok">${v.fUsedMem+v.fReqMem}</span>   Usedcores: ${v.fUsedCore} → <span class="ok">${v.fUsedCore+v.fReqCore}</span>
+
+<span class="key">⑦ 编码进 Pod 注解</span>
+   GPU-abc,NVIDIA,${v.fReqMem},${v.fReqCore}:`
+: `<span class="bad">✗ Fit 失败，这张卡被跳过（continue），继续看下一张</span>
+<span class="dim">   如果所有卡都被跳过，整个节点被判 unfit，
+   原因字符串会通过 Pod event 告诉用户，形如：
+   "1/2 CardInsufficientMemory"</span>`);
+  }
+  ids.forEach(id => document.getElementById(id).addEventListener('input', render));
+  render();
+})();
+
+/* ========== 实验室 3：三层结构可视化 ========== */
+(function () {
+  const host = document.getElementById('layerViz');
+  host.innerHTML = `
+<details class="fold" open>
+  <summary><code>PodDevices</code> — map[厂商]PodSingleDevice</summary>
+  <div class="fold-body">
+    <p style="font-size:13px;color:var(--fg-soft)">这个 Pod 同时用了两家硬件，所以 map 有两个 key。<b>每个 key 会写成一条独立的 Pod 注解。</b></p>
+
+    <details class="fold" open>
+      <summary><code>["NVIDIA"]</code> → PodSingleDevice（长度 = 容器数）→ 注解 <code>hami.io/vgpu-devices-to-allocate</code></summary>
+      <div class="fold-body">
+        <details class="fold" open>
+          <summary><code>[0]</code> → ContainerDevices — <b>InitContainer</b> 用的卡</summary>
+          <div class="fold-body"><div class="out" style="margin-top:8px">
+<span class="key">[0][0]</span> ContainerDevice{ UUID:"GPU-aaa", Type:"NVIDIA", Usedmem:2000, Usedcores:20 }</div></div>
+        </details>
+        <details class="fold" open>
+          <summary><code>[1]</code> → ContainerDevices — 第 1 个普通容器，用了 <b>2 张卡</b></summary>
+          <div class="fold-body"><div class="out" style="margin-top:8px">
+<span class="key">[1][0]</span> ContainerDevice{ UUID:"GPU-aaa", Type:"NVIDIA", Usedmem:3000, Usedcores:30 }
+<span class="key">[1][1]</span> ContainerDevice{ UUID:"GPU-bbb", Type:"NVIDIA", Usedmem:3000, Usedcores:30 }</div></div>
+        </details>
+        <details class="fold">
+          <summary><code>[2]</code> → ContainerDevices — 第 2 个普通容器，<b>不用 GPU（空切片）</b></summary>
+          <div class="fold-body"><div class="out" style="margin-top:8px"><span class="dim">[]  ← 空的，但位置必须占住，编码后是两个连续的 ";"</span></div></div>
+        </details>
+        <div class="out" style="margin-top:10px"><span class="dim">编码结果：</span>
+GPU-aaa,NVIDIA,2000,20:;GPU-aaa,NVIDIA,3000,30:GPU-bbb,NVIDIA,3000,30:;;</div>
+      </div>
+    </details>
+
+    <details class="fold">
+      <summary><code>["MLU"]</code> → PodSingleDevice → 注解 <code>hami.io/cambricon-mlu-devices-to-allocate</code></summary>
+      <div class="fold-body"><div class="out" style="margin-top:8px">
+<span class="key">[0]</span> []                       <span class="dim">← InitContainer 不用 MLU</span>
+<span class="key">[1]</span> []                       <span class="dim">← 第 1 个容器不用 MLU</span>
+<span class="key">[2][0]</span> ContainerDevice{ UUID:"MLU-xyz", Type:"MLU", Usedmem:8000, Usedcores:100 }</div></div>
+    </details>
+  </div>
+</details>`;
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>组件预览 — HAMi 源码导读</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main class="main">
+    <div class="page-kicker">第 05 章 · 一个 Pod 的旅程</div>
+    <h1 class="page-title">组件预览</h1>
+    <p class="page-lede">这一页只用来检查各个组件在真实样式下的观感，不进目录。</p>
+
+    <h2>1. 四种旁注</h2>
+    <div class="note">
+      <div class="t">普通旁注</div>
+      <p style="margin-bottom:0">节点用量是算出来的：静态清单加上本地缓存里所有已调度 Pod 的分配值。</p>
+    </div>
+    <div class="note tip">
+      <div class="t">补充说明</div>
+      <p style="margin-bottom:0">两种相反的策略靠同一个 <code>Less</code> 反转实现。</p>
+    </div>
+    <div class="note warn">
+      <div class="t">需要注意</div>
+      <p style="margin-bottom:0">节点基础分<b>不支持自定义权重</b>，只有卡级打分支持。</p>
+    </div>
+    <div class="note trap">
+      <div class="t">容易踩的坑</div>
+      <p style="margin-bottom:0">
+        <code>DeviceUsage</code> 是会被就地修改的，打分前必须 <code>DeepCopy()</code>，
+        否则一个节点的试算会污染另一个节点。
+      </p>
+    </div>
+
+    <h2>2. 代码块</h2>
+    <div class="codeblock" data-file="pkg/scheduler/score.go" data-start="86" data-lang="go" data-hl="4-8">
+<pre><code>func fitInDevices(node *NodeUsage, requests device.ContainerDeviceRequests) (bool, string) {
+	for index := range node.Devices.DeviceLists {
+		node.Devices.DeviceLists[index].ComputeScore(requests, weights)
+	}
+	for _, k := range requests {
+		sort.Sort(node.Devices)
+		devPlugin, ok := device.GetDevices()[k.Type]
+		if !ok {
+			return false, "Device type not found"
+		}
+		fit, tmpDevs, reason := devPlugin.Fit(typeDevices, k, pod, nodeInfo, devinput)
+		if !fit {
+			return false, reason
+		}
+	}
+	return true, ""
+}</code></pre>
+    </div>
+
+    <div class="codeblock" data-lang="bash" data-title="终端">
+<pre><code># 单个测试函数
+go test ./pkg/scheduler/ -run Test_calcScore -v -count=1
+
+# 打开 V5 日志看 Fit 逐卡拒绝的过程
+go test ./pkg/device/nvidia/ -run TestDevices_Fit -count=1 -args -v=5</code></pre>
+    </div>
+
+    <h2>3. 表格</h2>
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:130px">策略</th><th style="width:190px">排序（升序）</th><th>末尾是谁，就优先选谁</th></tr>
+      <tr><td><b>binpack</b></td><td>分数 低 → 高</td><td>分数最高，也就是最满的卡，把碎片塞满</td></tr>
+      <tr><td><b>spread</b></td><td>分数 高 → 低</td><td>分数最低，也就是最空的卡，负载摊开</td></tr>
+      <tr><td><b>mutex</b></td><td>已用份数 多 → 少</td><td>已用份数最少，也就是全空闲的卡</td></tr>
+    </table>
+    </div>
+
+    <h2>4. 交互面板</h2>
+    <div class="lab">
+      <header>卡级打分计算器<span class="badge">互动</span></header>
+      <div class="body">
+        <div class="field-row">
+          <div><label class="f">总份数</label><input type="number" value="10"></div>
+          <div><label class="f">已用份数</label><input type="number" value="2"></div>
+          <div><label class="f">总显存</label><input type="number" value="32768"></div>
+          <div><label class="f">已用显存</label><input type="number" value="8000"></div>
+        </div>
+        <div class="btns">
+          <button class="btn">重新计算</button>
+          <button class="btn ghost">载入示例</button>
+          <button class="btn ghost">重置</button>
+        </div>
+        <div class="out"><span class="key">usedScore</span> = (请求数 1 + 已用 2) / 总份数 10  = <span class="ok">0.3000</span>
+<span class="key">memScore </span> = (请求 3000 + 已用 8000) / 总显存 32768  = <span class="ok">0.3357</span>
+
+Score = 10 × (1×0.3000 + 1×0.2000 + 1×0.3357)
+      = <span class="ok">8.3572</span>
+
+<span class="dim">分数越高，放上去之后这张卡越满。</span>
+<span class="bad">✗ 第 ⑩ 关 CardInsufficientMemory — 剩余 2768MB &lt; 需要 8000MB</span>
+<span class="warn">⚠ 注解里没有 numa 这个 key</span></div>
+
+        <div class="devbar">
+          <div class="top"><span>GPU-0 A100-40GB numa0</span><span>score 8.36</span></div>
+          <div class="track"><i class="used" style="width:24%"></i><i class="new" style="width:18%"></i></div>
+          <div class="why pass">✓ 全部通过 → 选中</div>
+        </div>
+        <div class="devbar rejected">
+          <div class="top"><span>GPU-1 V100-32GB numa1</span><span>score 12.90</span></div>
+          <div class="track"><i class="used" style="width:88%"></i></div>
+          <div class="why">✗ 第 ⑩ 关 CardInsufficientMemory</div>
+        </div>
+      </div>
+    </div>
+
+    <h2>5. 步骤与流程</h2>
+    <ol class="steps">
+      <li><span class="st">跑通编解码的全部测试</span>
+        <div class="codeblock" data-lang="bash"><pre><code>go test ./pkg/device/ -run TestDecodeContainerDevices -v -count=1</code></pre></div>
+      </li>
+      <li><span class="st">改一个用例，验证你对某道关卡的理解</span>
+        找一个「显存刚好够」的用例，把 <code>Usedmem</code> 加 1，看是不是变成 <code>CardInsufficientMemory</code>。
+      </li>
+    </ol>
+
+    <div class="flow">
+      <div class="node">
+        <div class="h">fitInDevices<span class="tag">单容器</span></div>
+        <div class="d">给每张卡打分 → 排序 → 调后端 Fit() → 成功则记账</div>
+        <div class="src"><span data-srcref="pkg/scheduler/score.go:86"></span></div>
+      </div>
+      <div class="arrow">↓<span class="lbl">委托给具体厂商</span></div>
+      <div class="node">
+        <div class="h">NvidiaGPUDevices.Fit<span class="tag">14 道关卡</span></div>
+        <div class="d">从后往前遍历排好序的卡，逐张过筛</div>
+      </div>
+    </div>
+
+    <h2>6. 折叠与承接</h2>
+    <details class="fold" open>
+      <summary>确认这是不是真问题</summary>
+      <div class="fold-body">
+        <p style="margin-bottom:0">改之前先 <code>git log -L</code> 查历史，确认这不是有意为之。</p>
+      </div>
+    </details>
+    <details class="fold">
+      <summary>补测试</summary>
+      <div class="fold-body"><p style="margin-bottom:0">证明改动没有引入新的崩溃路径。</p></div>
+    </details>
+
+    <p class="next-hint">
+      节点和卡都选好了，注解也写进去了。下一章讲 Bind：怎么用节点锁防止并发超卖。
+    </p>
+
+    <div class="chapter-nav" id="chapterNav"></div>
+  </main>
+</div>
+<script src="assets/js/site.js"></script>
+</body>
+</html>

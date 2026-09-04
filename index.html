@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HAMi 源码导读</title>
+<link rel="stylesheet" href="assets/css/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2316181d'/%3E%3Ctext x='16' y='23' font-size='17' font-family='monospace' font-weight='bold' fill='%23fff' text-anchor='middle'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main class="main">
+
+    <div class="hero">
+      <h1>HAMi 源码导读</h1>
+      <p class="tagline">
+        跟着一个 Pod，走完它从 <code>kubectl apply</code> 到在 GPU 上跑起来的全过程。
+        13 章，每段代码都标注了所在文件和行号，GitHub 链接指向同一个 commit。
+      </p>
+      <div class="meta-chips">
+        <span class="chip">版本 <b>v2.10.0</b></span>
+        <span class="chip">commit <b>95530c6</b></span>
+        <span class="chip">Go 代码 <b>28,000 行</b></span>
+        <span class="chip">代码块 <b>212</b></span>
+      </div>
+    </div>
+
+    <h2>为什么需要一条主线</h2>
+
+    <p>
+      HAMi 的代码量不大，核心逻辑只有几千行。难的是它由三个独立进程组成：
+      调度器扩展器、设备插件、容器里的 CUDA 劫持库。
+      三者不直接通信，全靠 Kubernetes 注解里的字符串传话。
+    </p>
+
+    <p>
+      单独读任何一个组件，都会卡在「这个值是谁写进来的」。
+      所以这里的顺序不按目录结构走，而是按一个 Pod 实际经过的路径走。
+    </p>
+
+    <div class="flow">
+      <div class="node">
+        <div class="h">用户提交一个要 GPU 的 Pod</div>
+        <div class="d"><code>limits: nvidia.com/gpu: 1, nvidia.com/gpumem: 3000</code></div>
+      </div>
+      <div class="arrow">↓<span class="lbl">apiserver 准入</span></div>
+      <div class="node">
+        <div class="h">MutatingWebhook<span class="tag">第 03 章</span></div>
+        <div class="d">把 <code>schedulerName</code> 改成 <code>hami-scheduler</code>，补默认值，拦非法请求</div>
+      </div>
+      <div class="arrow">↓<span class="lbl">kube-scheduler 调扩展器 HTTP</span></div>
+      <div class="node">
+        <div class="h">Filter：同时选节点和选卡<span class="tag">第 04、05 章</span></div>
+        <div class="d">重建各节点用量，并发打分，逐卡过 14 道筛选，最后把「用哪几张卡、各扣多少」写进 Pod 注解</div>
+      </div>
+      <div class="arrow">↓<span class="lbl">POST /bind</span></div>
+      <div class="node">
+        <div class="h">Bind：抢节点锁再绑定<span class="tag">第 06、07 章</span></div>
+        <div class="d">锁一直持有到设备插件分配完，防止并发超卖</div>
+      </div>
+      <div class="arrow">↓<span class="lbl">kubelet 调设备插件 gRPC</span></div>
+      <div class="node">
+        <div class="h">Allocate：注解翻译成环境变量<span class="tag">第 08 章</span></div>
+        <div class="d">注入 <code>CUDA_DEVICE_MEMORY_LIMIT_0=3000m</code>，挂载 <code>libvgpu.so</code>，释放节点锁</div>
+      </div>
+      <div class="arrow">↓<span class="lbl">容器启动，ld.so.preload 生效</span></div>
+      <div class="node">
+        <div class="h">HAMi-core 在容器内拦 CUDA<span class="tag">第 09 章</span></div>
+        <div class="d">应用调 <code>cuMemAlloc</code>，超过 3000MB 返回 OOM；算力用令牌桶限速</div>
+      </div>
+    </div>
+
+    <h2>目录</h2>
+
+    <div id="roadmap"></div>
+
+    <h2>怎么读</h2>
+
+    <p>
+      每章的结构固定：先给一张源码地图，然后按执行顺序拆关键函数，
+      中间穿插可以直接操作的模拟器。
+      学习目标是可勾选的，勾完自动记进度，存在浏览器本地。
+    </p>
+
+    <p>
+      核心逻辑全是纯内存函数，不需要 GPU，也不需要 Kubernetes 集群。
+      打分、Fit 筛选、注解编解码都能用 <code>go test</code> 直接跑。
+      项目自带的表驱动用例（<code>score_test.go</code> 有 4600 行）比任何文档都完整，
+      改一个输入跑一次，比读十遍代码快。
+    </p>
+
+    <p>
+      建议按顺序读。第 01、02、05 章是主干，后面反复要用；
+      第 09、10 章第一遍看懂原理就行，等真要改那块时再回来。
+    </p>
+
+    <div class="note tip">
+      <div class="t">源码链接的处理</div>
+      <p style="margin-bottom:0">
+        所有 GitHub 链接和 <code>文件:行号</code> 引用都指向 commit
+        <code>95530c6</code>（<code>origin/master</code>，2026-09-02），
+        上游后续改动不会让链接跳错行。本地对照时先 <code>git checkout 95530c6</code>。
+        换版本只需改 <code>assets/js/site.js</code> 顶部的 <code>SOURCE</code>，
+        换版本后行号会漂移，需要重新校对。
+      </p>
+    </div>
+
+    <p class="next-hint">
+      从 <a href="chapters/00-start.html">第 00 章</a> 开始，
+      15 分钟把仓库跑起来，之后每一章的猜想都能当场验证。
+    </p>
+
+  </main>
+</div>
+
+<script src="assets/js/site.js"></script>
+<script>
+(function () {
+  const host = document.getElementById('roadmap');
+  let html = '';
+  CHAPTERS.forEach(g => {
+    html += `<div class="stage-label">${g.stage}</div><div class="roadmap">`;
+    g.items.forEach(c => {
+      html += `<a class="rm-card" data-ch="${c.id}" href="chapters/${c.file}">
+        <div class="n">${c.id}</div>
+        <div>
+          <div class="t">${c.title}</div>
+          <div class="d">${c.desc}</div>
+        </div>
+        <div class="r">${c.time}</div>
+      </a>`;
+    });
+    html += '</div>';
+  });
+  host.innerHTML = html;
+  updateProgress();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,857 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · HAMi-core — HAMi 源码导读</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2316181d'/%3E%3Ctext x='16' y='23' font-size='17' font-family='monospace' font-weight='bold' fill='%23fff' text-anchor='middle'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main class="main">
+
+    <div class="page-kicker">第 09 章 · 第三阶段 硬骨头</div>
+    <h1 class="page-title">HAMi-core：容器里的 CUDA 劫持</h1>
+    <p class="page-lede">
+      前面八章都在讲「怎么记账」。这一章讲<strong>怎么真正执法</strong>。一个 C 语言写的动态库，在容器内部把 CUDA API 全部换成自己的版本，
+      显存超了就报 OOM，算力多了就限速。
+    </p>
+
+    <div class="goals">
+      <h3>学完这章你应该能</h3>
+      <ul>
+        <li>解释 <code>LD_PRELOAD</code> / <code>ld.so.preload</code> 劫持的原理和边界</li>
+        <li>说清楚显存限额是怎么被检查的，以及为什么需要跨进程共享内存</li>
+        <li>解释算力限制的令牌桶模型：谁发令牌、谁花令牌、怎么调速</li>
+        <li>说出至少三种「劫持会失效」的场景</li>
+        <li>知道排查容器内 GPU 问题该看哪些日志和文件</li>
+      </ul>
+    </div>
+
+    <div class="note warn">
+      <div class="t">关于这一章的定位</div>
+      <p style="margin-bottom:0">
+        <code>libvgpu/</code> 是 C 代码，构建和调试方式跟 Go 部分完全不同，
+        而且改动它需要真实 GPU 才能验证。
+        <br>第一遍读，理解原理和边界就够了。知道「什么情况下限制会失效」，比背下每个函数更有价值。
+        真要动手改这块时再回来精读。
+      </p>
+    </div>
+
+    <h2>1. 劫持原理：换掉门口的接待员</h2>
+
+    <div class="note analogy">
+      <div class="t">动态链接器的「插队」机制</div>
+      <p>
+        Linux 程序调用 <code>cuMemAlloc()</code> 时，
+        动态链接器（<code>ld.so</code>）负责找到这个符号在哪个 <code>.so</code> 里。
+        它按<strong>固定顺序</strong>搜索已加载的库。
+      </p>
+      <p style="margin-bottom:0">
+        <code>/etc/ld.so.preload</code> 里列出的库会被<strong>插到队伍最前面</strong>。
+        所以只要 <code>libvgpu.so</code> 也导出一个叫 <code>cuMemAlloc</code> 的函数，
+        <strong>它就会先被找到</strong>。应用以为自己在调 CUDA，其实调的是 HAMi。
+      </p>
+    </div>
+
+    <div class="codeblock" data-file="lib/nvidia/ld.so.preload" data-lang="text" data-title="容器里挂载的这个文件，就是全部魔法">
+<pre><code>/usr/local/vgpu/libvgpu.so</code></pre>
+    </div>
+
+    <div class="flow">
+      <div class="node">
+        <div class="h">应用代码<span class="tag">PyTorch / TensorFlow</span></div>
+        <div class="d"><code>torch.cuda.empty_cache()</code> → <code>cudaMalloc()</code> → <code>cuMemAlloc_v2()</code></div>
+      </div>
+      <div class="arrow">↓<span class="lbl">动态链接器解析符号</span></div>
+      <div class="node">
+        <div class="h">libvgpu.so 的 cuMemAlloc_v2<span class="tag">劫持点</span></div>
+        <div class="d">检查额度 → 超了返回 <code>CUDA_ERROR_OUT_OF_MEMORY</code>；没超则记账后放行</div>
+        <div class="src"><span data-srcref="libvgpu/src/cuda/memory.c:119"></span></div>
+      </div>
+      <div class="arrow">↓<span class="lbl">CUDA_OVERRIDE_CALL 转发</span></div>
+      <div class="node">
+        <div class="h">真正的 libcuda.so<span class="tag">NVIDIA 驱动</span></div>
+        <div class="d">执行真实的显存分配</div>
+      </div>
+    </div>
+
+    <h2>2. 劫持是怎么实现的</h2>
+
+    <h3>2.1 拿到「真身」函数指针</h3>
+
+    <p>
+      劫持函数检查完额度后，得调用<strong>真正的</strong> CUDA 函数。
+      但它不能直接调 <code>cuMemAlloc</code>（那会调到自己，无限递归）。
+      解法是用 <code>dlsym(RTLD_NEXT, ...)</code> 在「队伍后面」找真身：
+    </p>
+
+    <div class="codeblock" data-file="libvgpu/src/cuda/hook.c" data-start="261" data-lang="c" data-hl="1,6-8,9-11,12-19">
+<pre><code>    table = dlopen(cuda_filename, RTLD_NOW | RTLD_NODELETE);   // 显式打开真正的 libcuda.so
+    if (!table) {
+        LOG_WARN("can't find library %s", cuda_filename);
+    }
+
+    for (i = 0; i &lt; CUDA_ENTRY_END; i++) {
+        LOG_DEBUG("LOADING %s %d",cuda_library_entry[i].name,i);
+        cuda_library_entry[i].fn_ptr = real_dlsym(table, cuda_library_entry[i].name);
+        if (!cuda_library_entry[i].fn_ptr) {
+            cuda_library_entry[i].fn_ptr=real_dlsym(RTLD_NEXT,cuda_library_entry[i].name);
+            //                                      ^^^^^^^^^ 「在我之后加载的库里找」
+            if (!cuda_library_entry[i].fn_ptr){
+                LOG_INFO("can't find function %s in %s", cuda_library_entry[i].name,cuda_filename);
+                snprintf(tmpfunc, sizeof(tmpfunc), "%s", cuda_library_entry[i].name);
+                while (prior_function(tmpfunc)) {         // 再退回去找老版本后缀
+                    cuda_library_entry[i].fn_ptr=real_dlsym(RTLD_NEXT,tmpfunc);
+                    if (cuda_library_entry[i].fn_ptr) {
+                        LOG_INFO("found prior function %s",tmpfunc);
+                        break;</code></pre>
+    </div>
+
+    <p>
+      三级降级查找：先在显式 dlopen 的 libcuda.so 里找 → 再用 <code>RTLD_NEXT</code> 找 →
+      还找不到就退回去找老版本后缀。
+      这种层层兜底说明现实中确实遇到过各种奇怪的运行环境。
+    </p>
+
+    <p>之后所有转发都通过一个宏：</p>
+
+    <div class="codeblock" data-lang="c" data-title="转发宏的用法（贯穿整个 libvgpu）">
+<pre><code>CUDA_OVERRIDE_CALL(cuda_library_entry, cuMemAlloc_v2, dptr, bytesize);
+//                 ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^
+//                 真身函数表           要调哪个        参数原样透传</code></pre>
+    </div>
+
+    <h3>2.2 处理 CUDA 的版本后缀地狱</h3>
+
+    <div class="codeblock" data-file="libvgpu/src/cuda/hook.c" data-start="317" data-lang="c" data-hl="3-6,8-9,10-12,13">
+<pre><code>void *find_symbols_in_table(const char *symbol) {
+    char symbol_v[500];
+    void *pfn;
+    /* Skip CUDA graph functions: let them fall through to real driver */
+    if (strncmp(symbol, "cuGraph", 7) == 0) {
+        return NULL;                          // CUDA Graph 不劫持，直接放行
+    }
+    snprintf(symbol_v, sizeof(symbol_v), "%s_v3", symbol);
+    if ((pfn = __dlsym_hook_section(NULL, symbol_v)) != NULL)
+        return pfn;                           // 优先找 _v3
+    symbol_v[strlen(symbol_v)-1]='2';
+    if ((pfn = __dlsym_hook_section(NULL, symbol_v)) != NULL)
+        return pfn;                           // 再找 _v2
+    return __dlsym_hook_section(NULL, symbol); // 最后找无后缀版本
+}</code></pre>
+    </div>
+
+    <div class="note trap">
+      <div class="t">CUDA API 的版本后缀是劫持最大的坑</div>
+      <p style="margin-bottom:0">
+        NVIDIA 改 API 时不改名字，而是加后缀：
+        <code>cuMemAlloc</code> → <code>cuMemAlloc_v2</code>。
+        应用链接的可能是任意一个版本。漏掉一个后缀，那条路径的限制就完全失效。应用可以随便分配显存，HAMi 一无所知。
+        <br>项目专门有个脚本在盯这个：
+        <span data-srcref="libvgpu/hack/check_cuda_hook_consistency.py"></span>。
+        <br>注意 <code>cuGraph*</code> 被<strong>显式跳过</strong>了 ——
+        CUDA Graph 里的显存分配<strong>绕过了 HAMi 的限制</strong>，这是一个已知的功能缺口。
+      </p>
+    </div>
+
+    <h3>2.3 更隐蔽的入口：cuGetProcAddress</h3>
+
+    <div class="codeblock" data-file="libvgpu/src/cuda/hook.c" data-start="347" data-lang="c" data-hl="1,3-6">
+<pre><code>CUresult (*cuGetProcAddress_real) ( const char* symbol, void** pfn, int  cudaVersion, cuuint64_t flags );
+
+CUresult _cuGetProcAddress ( const char* symbol, void** pfn, int  cudaVersion, cuuint64_t flags ) {
+    LOG_INFO("into _cuGetProcAddress symbol=%s:%d",symbol,cudaVersion);
+    ...
+        CUresult res = CUDA_OVERRIDE_CALL(cuda_library_entry,cuGetProcAddress,symbol,pfn,cudaVersion,flags);
+    ...
+}</code></pre>
+    </div>
+
+    <div class="note tip">
+      <div class="t">为什么必须劫持 <code>cuGetProcAddress</code></div>
+      <p style="margin-bottom:0">
+        CUDA 12 之后，运行时不再直接链接符号，而是调
+        <code>cuGetProcAddress("cuMemAlloc", &amp;fn, ...)</code> <strong>动态查询函数地址</strong>。
+        <br>这条路径<strong>完全绕过动态链接器</strong>。<code>ld.so.preload</code> 拦不住它。
+        <br>所以 HAMi 必须<strong>连查询函数本身也劫持掉</strong>，
+        在返回地址时偷偷换成自己的实现。
+        <br><em>这就是为什么劫持类工具需要持续跟进 CUDA 版本 —— 每个大版本都可能引入新的绕过路径。</em>
+      </p>
+    </div>
+
+    <h2>3. 显存限制</h2>
+
+    <h3>3.1 限额从哪来</h3>
+
+    <div class="codeblock" data-file="libvgpu/src/multiprocess/multiprocess_memory_limit.c" data-start="206" data-lang="c" data-hl="2,5-6,7,8-9,10-11,12-14">
+<pre><code>void do_init_device_memory_limits(uint64_t* arr, int len) {
+    size_t fallback_limit = get_limit_from_env(CUDA_DEVICE_MEMORY_LIMIT);   // 全局兜底
+    int i;
+    for (i = 0; i &lt; len; ++i) {
+        char env_name[CUDA_DEVICE_MEMORY_LIMIT_KEY_LENGTH];
+        snprintf(env_name, sizeof(env_name), "%s_%d", CUDA_DEVICE_MEMORY_LIMIT, i);
+        size_t cur_limit = get_limit_from_env(env_name);      // CUDA_DEVICE_MEMORY_LIMIT_0
+        if (cur_limit &gt; 0) {
+            arr[i] = cur_limit;                               // 每卡独立限额
+        } else if (fallback_limit &gt; 0) {
+            arr[i] = fallback_limit;                          // 退回全局限额
+        } else {
+            arr[i] = 0;                                       // 0 = 不限制
+        }
+    }
+}</code></pre>
+    </div>
+
+    <p>环境变量的值支持带单位后缀：</p>
+
+    <div class="codeblock" data-file="libvgpu/src/multiprocess/multiprocess_memory_limit.c" data-start="122" data-lang="c" data-hl="12-13,14-16,17-19,20-22,23-24">
+<pre><code>size_t get_limit_from_env(const char* env_name) {
+    char* env_limit = getenv(env_name);
+    if (env_limit == NULL) {
+        return 0;
+    }
+    size_t len = strlen(env_limit);
+    if (len == 0) {
+        return 0;
+    }
+    size_t scalar = 1;
+    char* digit_end = env_limit + len;
+    if (env_limit[len - 1] == 'G' || env_limit[len - 1] == 'g') {
+        digit_end -= 1;  scalar = 1024 * 1024 * 1024;
+    } else if (env_limit[len - 1] == 'M' || env_limit[len - 1] == 'm') {
+        digit_end -= 1;  scalar = 1024 * 1024;          // ← 设备插件用的是 "3000m"
+    } else if (env_limit[len - 1] == 'K' || env_limit[len - 1] == 'k') {
+        digit_end -= 1;  scalar = 1024;
+    }
+    size_t res = strtoul(env_limit, &amp;digit_end, 0);
+    size_t scaled_res = res * scalar;
+    ...
+}</code></pre>
+    </div>
+
+    <div class="note trap">
+      <div class="t"><code>0</code> 意味着「不限制」，不是「不给显存」</div>
+      <p style="margin-bottom:0">
+        这解释了第 02 章 <code>GenerateResourceRequests</code> 里那条注释：
+        <em>「0 would inject <code>CUDA_DEVICE_MEMORY_LIMIT=0m</code>, which hami-core reads as "no limit"」</em>。
+        <br>所以调度器那边用 <strong>101</strong> 当「未设置」的哨兵，
+        绝不能把 0 传下来 —— <strong>那等于给容器开了无限显存</strong>。
+        <br><em>这是一个跨越 Go 和 C 两侧的隐式契约，只看一边永远想不通为什么要用 101。</em>
+      </p>
+    </div>
+
+    <h3>3.2 OOM 检查</h3>
+
+    <div class="codeblock" data-file="libvgpu/src/allocator/allocator.c" data-start="36" data-lang="c" data-hl="7-8,10-12,14,15-17,19-24,26">
+<pre><code>int oom_check(const int dev, size_t addon) {
+    CUdevice d;
+    if (dev==-1)
+        cuCtxGetDevice(&amp;d);
+    else
+        d=dev;
+    uint64_t limit = get_current_device_memory_limit(d);
+    size_t _usage = get_gpu_memory_usage(d);          // 跨进程共享内存里读
+
+    if (limit == 0) {
+        return 0;                                     // 0 = 不限制，直接放行
+    }
+
+    size_t new_allocated = _usage + addon;
+    LOG_INFO("_usage=%lu limit=%lu new_allocated=%lu",_usage,limit,new_allocated);
+    if (new_allocated &gt; limit) {
+        LOG_ERROR("Device %d OOM %lu / %lu", d, new_allocated, limit);
+
+        lock_shrreg();
+        int cleared = clear_proc_slot_nolock(1);      // 先清理死进程的残留记账
+        unlock_shrreg();
+        if (cleared &gt; 0)
+            return oom_check(dev,addon);              // 清出空间了就重试一次
+        return 1;                                     // 真的 OOM
+    }
+    return 0;
+}</code></pre>
+    </div>
+
+    <div class="note tip">
+      <div class="t"><code>clear_proc_slot_nolock</code>。死进程的显存回收</div>
+      <p style="margin-bottom:0">
+        同一个容器里可能有多个进程共用限额。
+        如果某个进程崩了（没走正常的 free 路径），
+        它在共享内存里的记账还留着，会<strong>虚占额度</strong>。
+        <br>所以 OOM 之前先扫一遍：哪些 PID 已经不存在了，把它们的账清掉，
+        清出空间就重试。这是一个很实用的<strong>自愈</strong>设计。
+      </p>
+    </div>
+
+    <h3>3.3 劫持点长什么样</h3>
+
+    <div class="codeblock" data-file="libvgpu/src/cuda/memory.c" data-start="119" data-lang="c" data-hl="2,3,4-6,7-8">
+<pre><code>CUresult cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
+    LOG_INFO("into cuMemAllocing_v2 dptr=%p bytesize=%ld",dptr,bytesize);
+    ENSURE_RUNNING();                                 // 确保初始化完成
+    CUresult res = allocate_raw(dptr,bytesize);       // 走 HAMi 的分配器
+    if (res!=CUDA_SUCCESS)
+        return res;                                   // 超额 → 返回 OOM
+    LOG_INFO("res=%d, cuMemAlloc_v2 success dptr=%p bytesize=%lu",0,(void *)*dptr,bytesize);
+    return CUDA_SUCCESS;
+}</code></pre>
+    </div>
+
+    <div class="codeblock" data-file="libvgpu/src/allocator/allocator.c" data-start="232" data-lang="c">
+<pre><code>int allocate_raw(CUdeviceptr *dptr, size_t size) {
+    return add_chunk(dptr, size);      // → 内部先 oom_check(dev, size)，再转发给真 CUDA
+}</code></pre>
+    </div>
+
+    <h3>3.4 跨进程共享记账</h3>
+
+    <div class="note analogy">
+      <div class="t">合租房里的共用水表</div>
+      <p style="margin-bottom:0">
+        一个容器可能跑好几个进程（PyTorch DataLoader 的 worker、多卡训练的多个 rank）。
+        限额是给整个容器的，不是给单个进程的。
+        <br>所以记账不能放在进程内存里，得放在<strong>所有进程都能读写的地方</strong>。一个 mmap 的共享内存文件，路径由环境变量
+        <code>CUDA_DEVICE_MEMORY_SHARED_CACHE</code> 指定（第 08 章注入的）。
+      </p>
+    </div>
+
+    <div class="lab">
+      <header>显存限制模拟器<span class="badge">互动</span></header>
+      <div class="body">
+        <p style="font-size:13.5px;color:var(--fg-soft);margin-bottom:12px">
+          模拟容器内多个进程分配显存，看 <code>oom_check</code> 什么时候拦下来。
+        </p>
+        <div class="field-row">
+          <div><label class="f">CUDA_DEVICE_MEMORY_LIMIT_0</label><input type="text" id="mm_limit" value="3000m"></div>
+          <div><label class="f">本次要分配 MB</label><input type="number" id="mm_req" value="800"></div>
+        </div>
+        <div class="btns">
+          <button class="btn" id="mm_alloc">进程 A 分配</button>
+          <button class="btn" id="mm_alloc_b">进程 B 分配</button>
+          <button class="btn ghost" id="mm_kill">杀掉进程 B（不释放）</button>
+          <button class="btn ghost" id="mm_reset">重置</button>
+        </div>
+        <div class="out" id="mm_out"></div>
+      </div>
+    </div>
+
+    <h2>4. 算力限制：一个令牌桶</h2>
+
+    <div class="note analogy">
+      <div class="t">游乐场的门票</div>
+      <p style="margin-bottom:0">
+        每次启动 CUDA kernel 就像<strong>进游乐场，要交票</strong>（票数 = grid 大小）。<br>
+        票桶里的票有限，没票了就<strong>排队等</strong>。<br>
+        另有一个<strong>发票员</strong>（watcher 线程）定期往桶里放票 ——
+        放多放少取决于「当前实际利用率 vs 目标利用率」。
+        <br><br>
+        效果：长期平均利用率被控制在目标值附近，
+        但不是硬性瞬时限制（瞬时可能冲高）。
+      </p>
+    </div>
+
+    <h3>4.1 花票：rate_limiter</h3>
+
+    <div class="codeblock" data-file="libvgpu/src/multiprocess/multiprocess_utilization_watcher.c" data-start="39" data-lang="c" data-hl="2-5,11-16,18-20,22-30">
+<pre><code>void rate_limiter(int grids, int blocks) {
+  CUdevice current_device;
+  CUresult res = cuCtxGetDevice(&amp;current_device);
+  int device_id = (res == CUDA_SUCCESS) ? (int)current_device : 0;
+
+  int64_t before_cuda_cores = 0;
+  int64_t after_cuda_cores = 0;
+  int64_t kernel_size = grids;                        // 票价 = grid 数量
+
+  /* Fast exit using cached values — no shared memory access needed */
+  if (cached_sm_limit[device_id] &gt;= 100 || cached_sm_limit[device_id] == 0) {
+      return;                                         // 100% 或 0 = 不限制，快速返回
+  }
+  if (cached_util_switch == 0) {
+      return;                                         // 开关关闭
+  }
+
+  while (get_recent_kernel()&lt;0) {
+    sleep(1);
+  }
+  set_recent_kernel(2);
+
+  do {
+CHECK:
+      before_cuda_cores = g_cur_cuda_cores[device_id];
+      if (before_cuda_cores &lt; 0) {
+        nanosleep(&amp;g_cycle, NULL);                    // 没票了 → 睡一小会儿再看
+        goto CHECK;
+      }
+      after_cuda_cores = before_cuda_cores - kernel_size;
+  } while (!CAS(&amp;g_cur_cuda_cores[device_id], before_cuda_cores, after_cuda_cores));
+                                                      // CAS 保证多线程安全
+}</code></pre>
+    </div>
+
+    <div class="note warn">
+      <div class="t">这就是「HAMi 会让训练变慢」的原因</div>
+      <p style="margin-bottom:0">
+        <code>nanosleep</code> 是<strong>真的在阻塞调用方线程</strong>。
+        当算力配额用完时，你的 kernel launch 会卡在这里。
+        <br>所以 <code>gpucores</code> 设得太低会显著拖慢任务。
+        那个 fast exit（<code>&gt;= 100 || == 0</code> 直接返回）非常重要。不限制算力时，这个函数的开销接近于零。
+      </p>
+    </div>
+
+    <h3>4.2 发票：watcher 线程的 PID 控制</h3>
+
+    <div class="codeblock" data-file="libvgpu/src/multiprocess/multiprocess_utilization_watcher.c" data-start="72" data-lang="c" data-hl="1-2,5-9,11-14">
+<pre><code>static void change_token(int64_t delta, int device_id) {
+  int64_t cuda_cores_before = 0, cuda_cores_after = 0;
+
+  LOG_DEBUG("device %d: delta: %ld, curr: %ld", device_id, delta, g_cur_cuda_cores[device_id]);
+  do {
+    cuda_cores_before = g_cur_cuda_cores[device_id];
+    cuda_cores_after = cuda_cores_before + delta;
+
+    if (cuda_cores_after &gt; g_total_cuda_cores[device_id]) {
+      cuda_cores_after = g_total_cuda_cores[device_id];    // 封顶，防止攒票
+    }
+  } while (!CAS(&amp;g_cur_cuda_cores[device_id], cuda_cores_before, cuda_cores_after));
+}</code></pre>
+    </div>
+
+    <div class="codeblock" data-file="libvgpu/src/multiprocess/multiprocess_utilization_watcher.c" data-start="86" data-lang="c" data-hl="2-3,5-8,10-13,15-21">
+<pre><code>static int64_t delta(int up_limit, int user_current, int64_t share, int device_id) {
+  int utilization_diff =
+      abs(up_limit - user_current) &lt; 5 ? 5 : abs(up_limit - user_current);   // 最小步长 5
+  int64_t increment =
+      (int64_t)g_sm_num[device_id] * (int64_t)g_sm_num[device_id] *
+      (int64_t)g_max_thread_per_sm[device_id] * (int64_t)utilization_diff / 2560;
+      //  ↑ 步长跟 GPU 的 SM 数量和每 SM 线程数挂钩 —— 大卡步长更大
+
+  /* Accelerate cuda cores allocation when utilization vary widely */
+  if (utilization_diff &gt; up_limit / 2) {
+    increment = increment * utilization_diff * 2 / (up_limit + 1);           // 偏差大就加速
+  }
+
+  if (user_current &lt;= up_limit) {
+    share = (share + increment) &gt; g_total_cuda_cores[device_id]
+            ? g_total_cuda_cores[device_id]
+            : (share + increment);                     // 用少了 → 多发票
+  } else {
+    share = (share - increment) &lt; 0 ? 0 : (share - increment);   // 用多了 → 少发票
+  }
+
+  return share;
+}</code></pre>
+    </div>
+
+    <div class="lab">
+      <header>算力令牌桶模拟器<span class="badge">互动</span></header>
+      <div class="body">
+        <p style="font-size:13.5px;color:var(--fg-soft);margin-bottom:12px">
+          设定目标利用率，点「推进一轮」看令牌数和实际利用率怎么收敛。
+        </p>
+        <div class="field-row">
+          <div><label class="f">目标利用率 %（SM_LIMIT）</label><input type="number" id="tk_limit" value="30"></div>
+          <div><label class="f">应用的"胃口" %</label><input type="number" id="tk_demand" value="90"></div>
+        </div>
+        <div class="btns">
+          <button class="btn" id="tk_step">推进一轮</button>
+          <button class="btn" id="tk_run10">连推 10 轮</button>
+          <button class="btn ghost" id="tk_reset">重置</button>
+        </div>
+        <div class="out" id="tk_out"></div>
+      </div>
+    </div>
+
+    <h2>5. 劫持失效的场景（最重要的一节）</h2>
+
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:190px">场景</th><th>为什么会失效</th><th style="width:130px">对策</th></tr>
+      <tr>
+        <td><b>特权容器</b></td>
+        <td>能直接访问 <code>/dev/nvidia*</code>，可以自己 <code>dlopen</code> 真 libcuda，或者干脆改掉 <code>ld.so.preload</code></td>
+        <td>webhook 直接拒绝（第 03 章）</td>
+      </tr>
+      <tr>
+        <td><b>静态链接 CUDA</b></td>
+        <td>符号在编译期就绑定了，动态链接器插不进来</td>
+        <td>无解。极少见</td>
+      </tr>
+      <tr>
+        <td><b>CUDA Graph</b></td>
+        <td><code>find_symbols_in_table</code> 显式跳过 <code>cuGraph*</code>；图内的分配不经过劫持点</td>
+        <td>已知缺口</td>
+      </tr>
+      <tr>
+        <td><b>新版 CUDA 的新 API</b></td>
+        <td>NVIDIA 加了新的分配路径或新的 <code>_v4</code> 后缀，HAMi 还没跟进</td>
+        <td>持续跟进；<code>hack/check_cuda_hook_consistency.py</code></td>
+      </tr>
+      <tr>
+        <td>应用直接改 <code>/etc/ld.so.preload</code></td>
+        <td>容器内有 root 就能改，改完重启进程即绕过</td>
+        <td>非特权 + 只读挂载可缓解</td>
+      </tr>
+      <tr>
+        <td><b>非 CUDA 路径占显存</b></td>
+        <td>比如通过 NVENC/NVDEC 视频编解码、或直接 ioctl</td>
+        <td>不在劫持范围内</td>
+      </tr>
+    </table>
+    </div>
+
+    <div class="note trap">
+      <div class="t">这决定了 HAMi 的安全模型</div>
+      <p style="margin-bottom:0">
+        HAMi-core 是「防君子不防小人」的用户态限制，
+        不是硬件级隔离（那是 MIG 干的事，第 10 章）。
+        <br>它适合<strong>可信租户之间的资源公平共享</strong>，
+        不适合作为多租户之间的安全边界。
+        <br>这个定位一定要清楚 —— 在生产环境做技术选型时，
+        「用 HAMi 共享还是用 MIG 硬隔离」取决于你的租户是否互信。
+      </p>
+    </div>
+
+    <h2>6. vGPUmonitor：读共享内存出指标</h2>
+
+    <p>
+      HAMi-core 把用量写在共享内存里，vGPUmonitor 这个 DaemonSet 定期去读，
+      转成 Prometheus 指标：
+    </p>
+
+    <div class="codeblock" data-file="pkg/monitor/nvidia/cudevshr.go" data-start="47" data-lang="go" data-hl="1-2">
+<pre><code>type headerT struct {
+	// 跟 C 侧共享内存布局严格对齐的结构体
+	...
+}</code></pre>
+    </div>
+
+    <div class="note trap">
+      <div class="t">Go 结构体必须和 C 结构体<b>逐字节对齐</b></div>
+      <p style="margin-bottom:0">
+        <code>pkg/monitor/nvidia/</code> 下有 <code>v0/spec.go</code> 和 <code>v1/spec.go</code> 两个版本，
+        对应 C 侧共享内存格式的两个版本。
+        <br>C 侧改了结构体而 Go 侧没跟着改，读出来就是垃圾数据（而且不会报错，
+        只是指标变成乱七八糟的数字）。
+        <br><em>这是跨语言共享内存的经典风险。改 <code>multiprocess/common_header.h</code> 时，
+        一定要同步检查 <code>pkg/monitor/nvidia/v*/spec.go</code>。</em>
+      </p>
+    </div>
+
+    <h2>7. 排障指南</h2>
+
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:230px">症状</th><th>先看什么</th></tr>
+      <tr>
+        <td>容器里 <code>nvidia-smi</code> 显示整卡显存，不是限额</td>
+        <td><b>这是正常的。</b><code>nvidia-smi</code> 走 NVML，HAMi 也劫持了部分 NVML 接口，
+            但显示逻辑复杂。以应用实际能分配到多少为准</td>
+      </tr>
+      <tr>
+        <td>应用报 CUDA OOM，但显存明明够</td>
+        <td>看 <code>CUDA_DEVICE_MEMORY_LIMIT_*</code> 是不是设小了；
+            开 <code>LIBCUDA_LOG_LEVEL=4</code> 看 <code>_usage / limit</code> 的日志行</td>
+      </tr>
+      <tr>
+        <td>限制完全没生效</td>
+        <td>① <code>cat /etc/ld.so.preload</code> 有没有内容<br>
+            ② <code>ls /usr/local/vgpu/libvgpu.so</code> 存不存在<br>
+            ③ <code>env | grep CUDA_DEVICE</code> 变量在不在<br>
+            ④ 是不是特权容器 / 静态链接</td>
+      </tr>
+      <tr>
+        <td>训练明显变慢</td>
+        <td><code>gpucores</code> 设太低，<code>rate_limiter</code> 在 <code>nanosleep</code>。
+            试试 <code>GPU_CORE_UTILIZATION_POLICY=disable</code> 对比</td>
+      </tr>
+      <tr>
+        <td>多进程容器用量统计不对</td>
+        <td>看 <code>CUDA_DEVICE_MEMORY_SHARED_CACHE</code> 指向的目录权限、
+            以及有没有僵尸进程占着 slot</td>
+      </tr>
+    </table>
+    </div>
+
+    <h2>8. 动手实验</h2>
+
+    <ol class="steps">
+      <li>
+        <span class="st">看看到底劫持了多少个函数</span>
+        <div class="codeblock" data-lang="bash"><pre><code># 劫持函数表
+grep -c "\.name = " libvgpu/src/cuda/hook.c
+grep -n "\.name = \"cuMem" libvgpu/src/cuda/hook.c | head -20</code></pre></div>
+      </li>
+      <li>
+        <span class="st">跑一致性检查脚本</span>
+        <div class="codeblock" data-lang="bash"><pre><code>python3 libvgpu/hack/check_cuda_hook_consistency.py
+# 它检查劫持表和实现之间有没有遗漏</code></pre></div>
+      </li>
+      <li>
+        <span class="st">找出所有会做 OOM 检查的分配路径</span>
+        <div class="codeblock" data-lang="bash"><pre><code>grep -n "oom_check" libvgpu/src/allocator/allocator.c
+# 每一处都是一条可能超额的路径，漏一处限制就有洞</code></pre></div>
+      </li>
+      <li>
+        <span class="st">编译 libvgpu（需要 Linux + CUDA 头文件）</span>
+        <div class="codeblock" data-lang="bash"><pre><code>cd libvgpu
+cat build.sh          # 先看构建流程
+bash build.sh         # 需要 cmake + CUDA toolkit</code></pre></div>
+      </li>
+      <li>
+        <span class="st">在真实容器里验证劫持生效</span>
+        <div class="codeblock" data-lang="bash"><pre><code>kubectl exec -it &lt;gpu-pod&gt; -- bash
+
+cat /etc/ld.so.preload                    # 应该有 /usr/local/vgpu/libvgpu.so
+env | grep CUDA_DEVICE                    # 看限额
+export LIBCUDA_LOG_LEVEL=4                # 打开详细日志
+
+python -c "import torch; torch.zeros(1024**3, dtype=torch.int8, device='cuda')"
+# 分配 1GB，看日志里的 _usage / limit 行</code></pre></div>
+      </li>
+      <li>
+        <span class="st">检查 Go 侧和 C 侧的共享内存结构是否对齐</span>
+        <div class="codeblock" data-lang="bash"><pre><code>head -60 libvgpu/src/multiprocess/common_header.h
+head -60 pkg/monitor/nvidia/v1/spec.go
+# 逐字段对比，看有没有漂移</code></pre></div>
+      </li>
+    </ol>
+
+    <h2>9. 本章自测</h2>
+
+    <div class="quiz" data-answer="B">
+      <div class="q"><code>CUDA_DEVICE_MEMORY_LIMIT_0=0m</code> 会发生什么？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>容器无法分配任何显存</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>被解释为「不限制」，容器可以用光整张卡的显存</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>libvgpu.so 加载失败</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>使用默认值 1GB</span></div>
+      <div class="expl">
+        看 <code>oom_check</code>：<code>if (limit == 0) return 0;</code>。直接放行。
+        <br>这就是为什么调度器侧的 <code>MemPercentagereq</code> 要用 <strong>101</strong> 当哨兵，
+        而不是用 0 表示「未设置」：一旦 0 被当成真实值传下来，
+        这个容器就获得了无限显存，直接击穿整个隔离机制。
+        <br>Go 代码里那条注释专门解释了这一点 —— 这是一个跨语言的隐式契约。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="C">
+      <div class="q">为什么 HAMi 必须劫持 <code>cuGetProcAddress</code>？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>为了统计 API 调用次数</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>因为它也会分配显存</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>CUDA 12+ 通过它动态查询函数地址，这条路径完全绕过动态链接器，<code>ld.so.preload</code> 拦不住</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>为了兼容旧版驱动</span></div>
+      <div class="expl">
+        <code>ld.so.preload</code> 只在<strong>符号解析</strong>时起作用。
+        如果应用用 <code>cuGetProcAddress("cuMemAlloc", &amp;fn, ...)</code> 主动查地址，
+        拿到的是驱动里的真实地址，之后直接通过函数指针调用 —— <strong>劫持完全失效</strong>。
+        <br>所以必须把这个「查询函数」本身也劫持掉，在它返回地址时换成 HAMi 的版本。
+        <br>每个 CUDA 大版本都可能引入新的绕过路径，这是劫持类方案的<strong>固有维护成本</strong>。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="A">
+      <div class="q">算力限制的令牌桶里，<strong>谁</strong>消耗令牌？消耗多少？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>每次 kernel launch 消耗 <code>grids</code> 个令牌；没令牌就 <code>nanosleep</code> 阻塞等待</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>每次显存分配消耗，按字节数</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>watcher 线程按时间消耗</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>驱动自动消耗</span></div>
+      <div class="expl">
+        看 <code>rate_limiter(int grids, int blocks)</code>：
+        <code>kernel_size = grids</code>，然后 CAS 循环把 <code>g_cur_cuda_cores</code> 减掉这个数。
+        令牌为负时 <code>nanosleep</code> 后重试。
+        <br>这也解释了「HAMi 会让训练变慢」。真的在阻塞调用线程。<code>gpucores</code> 设得越低，阻塞越频繁。
+        <br>发令牌的是 watcher 线程，按「实际利用率 vs 目标利用率」的偏差动态调整发放量。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="D">
+      <div class="q">下面哪种情况 HAMi-core 的显存限制<strong>不会</strong>失效？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>容器以 <code>privileged: true</code> 运行</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>应用使用 CUDA Graph 里的显存分配</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>应用在容器里以 root 身份清空了 <code>/etc/ld.so.preload</code></span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>容器里同时跑了 4 个 Python 进程</span></div>
+      <div class="expl">
+        多进程正是 HAMi-core 专门设计了跨进程共享内存来处理的场景：
+        限额是给整个容器的，4 个进程共享同一个额度，记账写在 mmap 的共享文件里
+        （<code>CUDA_DEVICE_MEMORY_SHARED_CACHE</code>）。
+        <br>A、B、C 都是真实的失效场景：
+        A 被 webhook 拒绝（第 03 章）；B 是代码里显式跳过的已知缺口；
+        C 说明 HAMi-core 是「防君子不防小人」的用户态限制，不是安全边界。
+      </div>
+    </div>
+
+    <h2>10. 小结</h2>
+
+    <ul>
+      <li>劫持靠 <code>/etc/ld.so.preload</code> 让 <code>libvgpu.so</code> <b>抢先导出 CUDA 符号</b>，
+          再用 <code>dlsym(RTLD_NEXT)</code> 拿真身转发。</li>
+      <li>CUDA 12+ 的 <code>cuGetProcAddress</code> 绕过动态链接器，<b>必须连它一起劫持</b>。</li>
+      <li>显存限额 <b>0 = 不限制</b>。这是 Go 侧用 101 当哨兵的根本原因。</li>
+      <li>OOM 检查前会<b>清理死进程的残留记账</b>，清出空间就重试。</li>
+      <li>算力用<b>令牌桶</b>：kernel launch 花票（花完 <code>nanosleep</code> 阻塞），watcher 按利用率偏差发票。</li>
+      <li>失效场景要牢记：特权容器、CUDA Graph、静态链接、新 API、改 ld.so.preload。</li>
+      <li>HAMi-core 是资源公平共享机制，不是多租户安全边界。需要硬隔离就用 MIG。</li>
+      <li>Go 侧 <code>pkg/monitor/nvidia/v*/spec.go</code> 必须和 C 侧结构体<b>逐字节对齐</b>。</li>
+    </ul>
+
+    <p class="next-hint">既然提到了硬隔离 —— 下一章讲 <strong>MIG</strong>（NVIDIA 的硬件级切分）、
+        <strong>NVLink 拓扑感知</strong>和 <strong>NUMA 回填</strong>，
+        这是 HAMi 里技术含量最高的三块。</p>
+
+    <div class="chapter-nav" id="chapterNav"></div>
+  </main>
+</div>
+
+<script src="../assets/js/site.js"></script>
+<script>
+/* ========== 实验室 1：显存限制模拟器 ========== */
+(function () {
+  let procs = { A: 0, B: 0 };
+  let bKilled = false;
+  const out = document.getElementById('mm_out');
+
+  function parseLimit(s) {
+    s = (s || '').trim();
+    if (!s) return 0;
+    const last = s[s.length - 1].toLowerCase();
+    const scalar = last === 'g' ? 1024 : last === 'm' ? 1 : last === 'k' ? 1 / 1024 : 1;
+    const num = parseFloat(s);
+    if (isNaN(num)) return 0;
+    return Math.round(num * scalar);
+  }
+
+  function show(msg) {
+    const limit = parseLimit(document.getElementById('mm_limit').value);
+    const usage = procs.A + (bKilled ? procs.B : procs.B);
+    const live = procs.A + (bKilled ? 0 : procs.B);
+    let html = `<span class="key">共享内存记账（CUDA_DEVICE_MEMORY_SHARED_CACHE）</span>
+   进程 A (pid 101)  ${procs.A} MB   <span class="ok">存活</span>
+   进程 B (pid 102)  ${procs.B} MB   ${bKilled ? '<span class="bad">已死亡 —— 记账还留在共享内存里！</span>' : '<span class="ok">存活</span>'}
+   ────────────────────────────
+   get_gpu_memory_usage() = <span class="key">${usage} MB</span>
+   limit                  = <span class="key">${limit === 0 ? '0（不限制！）' : limit + ' MB'}</span>
+`;
+    if (limit === 0) {
+      html += `\n<span class="bad">limit == 0 → oom_check 第一件事就是 return 0，直接放行。</span>
+<span class="dim">   容器可以用光整张卡的显存。
+   这就是 Go 侧必须用 101 当「未设置」哨兵、绝不能传 0 的原因。</span>`;
+    }
+    if (msg) html += '\n' + msg;
+    out.innerHTML = html;
+  }
+
+  function alloc(who) {
+    const limit = parseLimit(document.getElementById('mm_limit').value);
+    const req = parseInt(document.getElementById('mm_req').value, 10) || 0;
+    if (limit === 0) { procs[who] += req; show(`\n<span class="warn">→ 无限制，分配成功。累计 ${procs.A + procs.B} MB</span>`); return; }
+
+    let usage = procs.A + procs.B;
+    let newAlloc = usage + req;
+    let log = `\n<span class="key">oom_check(dev=0, addon=${req})</span>
+   _usage=${usage} limit=${limit} new_allocated=${newAlloc}`;
+
+    if (newAlloc > limit) {
+      log += `\n   <span class="bad">LOG_ERROR: Device 0 OOM ${newAlloc} / ${limit}</span>`;
+      if (bKilled && procs.B > 0) {
+        log += `\n   <span class="warn">→ lock_shrreg(); clear_proc_slot_nolock(1)</span>`;
+        log += `\n   <span class="ok">   发现 pid 102 已不存在，清掉它的 ${procs.B} MB 记账</span>`;
+        procs.B = 0;
+        bKilled = false;
+        usage = procs.A;
+        newAlloc = usage + req;
+        log += `\n   <span class="warn">→ cleared > 0 → 递归重试 oom_check</span>`;
+        log += `\n   _usage=${usage} limit=${limit} new_allocated=${newAlloc}`;
+        if (newAlloc > limit) {
+          log += `\n   <span class="bad">仍然 OOM → return 1 → cuMemAlloc_v2 返回 CUDA_ERROR_OUT_OF_MEMORY(2)</span>`;
+          show(log); return;
+        }
+        procs[who] += req;
+        log += `\n   <span class="ok">✓ 这次够了 → 分配成功（自愈生效）</span>`;
+        show(log); return;
+      }
+      log += `\n   <span class="dim">→ clear_proc_slot_nolock 没清出空间（没有死进程）</span>`;
+      log += `\n   <span class="bad">→ return 1 → 应用看到 CUDA_ERROR_OUT_OF_MEMORY(2)</span>`;
+      log += `\n   <span class="dim">   PyTorch 会抛 "CUDA out of memory"</span>`;
+      show(log); return;
+    }
+    procs[who] += req;
+    log += `\n   <span class="ok">✓ 未超额 → 转发给真正的 libcuda.so → 分配成功</span>`;
+    show(log);
+  }
+
+  document.getElementById('mm_alloc').addEventListener('click', () => alloc('A'));
+  document.getElementById('mm_alloc_b').addEventListener('click', () => alloc('B'));
+  document.getElementById('mm_kill').addEventListener('click', () => {
+    if (procs.B === 0) { show('\n<span class="dim">进程 B 还没分配过显存。</span>'); return; }
+    bKilled = true;
+    show(`\n<span class="warn">进程 B 被 kill -9，没走 cuMemFree 路径。</span>
+<span class="dim">   它的 ${procs.B} MB 记账还留在共享内存里，虚占额度。
+   下次 OOM 时 clear_proc_slot_nolock 会扫出来清掉 —— 试试再分配一次。</span>`);
+  });
+  document.getElementById('mm_reset').addEventListener('click', () => {
+    procs = { A: 0, B: 0 }; bKilled = false; show('<span class="dim">已重置</span>');
+  });
+  document.getElementById('mm_limit').addEventListener('input', () => show());
+  show();
+})();
+
+/* ========== 实验室 2：令牌桶模拟器 ========== */
+(function () {
+  const TOTAL = 100000;   // g_total_cuda_cores，简化
+  let tokens = TOTAL;
+  let util = 0;
+  let round = 0;
+  let hist = [];
+  const out = document.getElementById('tk_out');
+
+  function step() {
+    const limit = parseInt(document.getElementById('tk_limit').value, 10) || 30;
+    const demand = parseInt(document.getElementById('tk_demand').value, 10) || 90;
+    round++;
+
+    // 应用在这一轮消耗令牌（受令牌数和胃口共同限制）
+    const wanted = TOTAL * demand / 100;
+    const spent = Math.max(0, Math.min(wanted, tokens));
+    tokens -= spent;
+    util = Math.round(spent / TOTAL * 100);
+
+    // watcher 计算 delta 并发票（复刻 delta() 的逻辑）
+    const diff = Math.max(5, Math.abs(limit - util));
+    let increment = TOTAL * diff / 256;              // 简化的步长公式
+    if (diff > limit / 2) increment = increment * diff * 2 / (limit + 1);
+    if (util <= limit) tokens = Math.min(TOTAL, tokens + increment);
+    else tokens = Math.max(0, tokens - increment);
+
+    hist.push({ round, util, tokens: Math.round(tokens), diff, dir: util <= limit ? '发票' : '收票' });
+    if (hist.length > 12) hist.shift();
+    render(limit);
+  }
+
+  function render(limit) {
+    limit = limit || parseInt(document.getElementById('tk_limit').value, 10) || 30;
+    let html = `<span class="key">目标利用率 ${limit}%   总令牌 ${TOTAL}</span>\n\n`;
+    html += `<span class="dim">轮次   实际利用率   令牌余量        watcher 动作</span>\n`;
+    hist.forEach(h => {
+      const bar = '█'.repeat(Math.max(0, Math.round(h.util / 5)));
+      const cls = Math.abs(h.util - limit) <= 8 ? 'ok' : 'warn';
+      html += `${String(h.round).padStart(3)}    <span class="${cls}">${String(h.util).padStart(3)}%</span> ${bar.padEnd(20)} ${String(h.tokens).padStart(7)}   ${h.dir}(diff=${h.diff})\n`;
+    });
+    if (hist.length === 0) html += '<span class="dim">   点「推进一轮」开始</span>\n';
+    html += `\n<span class="dim">观察：利用率会围绕目标值<b>震荡收敛</b>，不是硬性瞬时限制。
+偏差大时 increment 被放大（那行 "Accelerate cuda cores allocation"），收敛更快。
+令牌为负时 rate_limiter 会 nanosleep 阻塞 kernel launch —— 这就是"HAMi 让训练变慢"的来源。</span>`;
+    out.innerHTML = html;
+  }
+
+  document.getElementById('tk_step').addEventListener('click', step);
+  document.getElementById('tk_run10').addEventListener('click', () => { for (let i = 0; i < 10; i++) step(); });
+  document.getElementById('tk_reset').addEventListener('click', () => {
+    tokens = TOTAL; util = 0; round = 0; hist = []; render();
+  });
+  render();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>00 · 开始之前 — HAMi 源码导读</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2316181d'/%3E%3Ctext x='16' y='23' font-size='17' font-family='monospace' font-weight='bold' fill='%23fff' text-anchor='middle'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main class="main">
+
+    <div class="page-kicker">第 00 章 · 第一阶段 打地基</div>
+    <h1 class="page-title">开始之前：环境、全景与读码方法</h1>
+    <p class="page-lede">
+      别急着打开 <code>scheduler.go</code>。先花 30 分钟把仓库跑起来、建立一张地图、
+      学会三种"验证猜想"的手段 —— 后面每一章你都会用到它们。
+    </p>
+
+    <div class="goals">
+      <h3>学完这章你应该能</h3>
+      <ul>
+        <li>说出 HAMi 的三个二进制分别叫什么、跑在哪、干什么</li>
+        <li>在本地成功跑通至少一个单元测试（不需要 K8s 集群，不需要 GPU）</li>
+        <li>拿到一个陌生函数名，30 秒内定位到它在哪个文件</li>
+        <li>知道遇到"这段代码到底怎么跑的"时，用哪三招去验证</li>
+      </ul>
+    </div>
+
+    <h2>1. HAMi 是什么：一句话和一个类比</h2>
+
+    <p>
+      一句话：HAMi 让一张物理 GPU 能被多个 Pod 安全地共享，并且让 Kubernetes 调度器知道该把 Pod 放到哪张卡上。
+    </p>
+
+    <p>
+      原生 Kubernetes 只能整卡分配：你申请 <code>nvidia.com/gpu: 1</code>，就独占一整张 A100。
+      一个只需要 3GB 显存的推理服务，也会把 80GB 的卡整张吃掉。HAMi 解决的就是这件事。
+    </p>
+
+    <p>要做到这件事，需要三个组件各管一段：</p>
+
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:160px">组件</th><th style="width:130px">跑在哪</th><th>负责什么</th></tr>
+      <tr><td>Device Plugin</td><td>每个 GPU 节点</td>
+        <td>每 30 秒向集群汇报本机有几张卡、每张多大、还剩多少</td></tr>
+      <tr><td>Scheduler Extender</td><td>集群，多副本选主</td>
+        <td>根据「要几张、要多少显存、要不要挨着」选出节点和具体的卡，把结果写进 Pod 注解</td></tr>
+      <tr><td>HAMi-core</td><td>每个业务容器内</td>
+        <td>拦住越界：只租了 3000MB 显存，申请到 3001MB 就返回 OOM</td></tr>
+    </table>
+    </div>
+
+    <p>
+      这三件事分别由三个独立进程完成，它们<strong>不直接通信</strong>，
+      而是通过 Kubernetes 上的注解（annotation）字符串传话。
+      这就是下一章要讲的"普通话"，也是整个项目的骨架。
+    </p>
+
+    <h2>2. 环境准备（15 分钟）</h2>
+
+    <div class="note">
+      <div class="t">好消息</div>
+      <p style="margin-bottom:0">
+        学习 HAMi 源码不需要 GPU，也不需要 Kubernetes 集群。
+        它的核心逻辑（打分、Fit 筛选、注解编解码）全是纯内存函数，
+        <code>go test</code> 就能跑。集群只在你想做端到端验证时才需要。
+      </p>
+    </div>
+
+    <h3>2.1 你需要什么</h3>
+
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:130px">工具</th><th style="width:110px">版本</th><th>说明</th></tr>
+      <tr><td><b>Go</b></td><td><code>1.27.0</code></td><td>见 <span data-srcref="go.mod:3"></span>。低版本会因为用了 <code>strings.SplitSeq</code> 等新 API 编译失败</td></tr>
+      <tr><td><b>Git</b></td><td>任意</td><td>—</td></tr>
+      <tr><td>golangci-lint</td><td>见脚本</td><td>可选，提 PR 前才需要，版本固定在 <span data-srcref="hack/verify-staticcheck.sh"></span></td></tr>
+      <tr><td>Docker</td><td>任意</td><td>可选，只在 <code>make docker</code> 时需要</td></tr>
+      <tr><td>K8s 集群</td><td>1.16+</td><td>可选，只在做 e2e 验证时需要</td></tr>
+    </table>
+    </div>
+
+    <h3>2.2 拉代码并切到对照的 commit</h3>
+
+    <p>
+      本教程所有行号都对应 commit <code>95530c6</code>。<strong>强烈建议你也切过去</strong>，
+      这样文中说的"第 853 行"在你本地也确实是第 853 行。
+    </p>
+
+    <div class="codeblock" data-lang="bash">
+<pre><code>git clone https://github.com/Project-HAMi/HAMi.git
+cd HAMi
+
+# 切到本文对照的 commit，行号完全一致
+git checkout 95530c6ad09c4f3cf8651cfe53a89eda69238a85
+
+# 拉依赖（国内建议先设代理）
+go env -w GOPROXY=https://goproxy.cn,direct
+go mod download</code></pre>
+    </div>
+
+    <h3>2.3 第一次编译</h3>
+
+    <div class="codeblock" data-lang="bash">
+<pre><code># 一次编译出全部三个二进制到 bin/
+make build
+
+# 看看产出了什么
+ls -la bin/
+# scheduler              调度器扩展器
+# vGPUmonitor            容器内 GPU 用量监控
+# nvidia-device-plugin   NVIDIA 设备插件</code></pre>
+    </div>
+
+    <p>
+      构建规则很简单，就两条 <code>go build</code>，
+      目标名写在 <span data-srcref="version.mk:3"></span>：
+      <code>CMDS=scheduler vGPUmonitor</code> 和 <code>DEVICES=nvidia</code>。
+    </p>
+
+    <div class="codeblock" data-file="Makefile" data-start="51" data-lang="bash" data-hl="1,3,6">
+<pre><code>build: $(CMDS) $(DEVICES)
+
+$(CMDS):
+	$(GO) build -ldflags '$(GO_BUILD_LDFLAGS)' -o ${OUTPUT_DIR}/$@ ./cmd/$@
+
+$(DEVICES):
+	$(GO) build -ldflags '$(GO_BUILD_LDFLAGS)' -o ${OUTPUT_DIR}/$@-device-plugin ./cmd/device-plugin/$@</code></pre>
+    </div>
+
+    <div class="note trap">
+      <div class="t">Windows 用户注意</div>
+      <p style="margin-bottom:0">
+        <code>make build</code> 在 Windows 上会失败（部分代码有 <code>_linux.go</code> 后缀，
+        比如 <span data-srcref="pkg/device-plugin/nvidiadevice/nvinternal/hostpid/broker_linux.go"></span>）。
+        但<strong>单元测试完全能跑</strong>，读源码不受影响。
+        想编译就用 WSL2 或者加 <code>GOOS=linux go build ./...</code> 做语法检查。
+      </p>
+    </div>
+
+    <h2>3. 仓库全景：代码量分布决定你的投入</h2>
+
+    <p>拿到一个 28,000 行的项目，第一件事是搞清楚"重量"分布在哪。</p>
+
+    <div class="lab">
+      <header>代码量分布<span class="badge">互动</span></header>
+      <div class="body">
+        <p style="font-size:13.5px;color:var(--fg-soft);margin-bottom:14px">
+          非测试 Go 代码行数。点击条目看该目录的作用和对应章节。
+        </p>
+        <div id="locChart"></div>
+        <div class="out" id="locOut">点上面任意一条看说明</div>
+      </div>
+    </div>
+
+    <div class="note">
+      <div class="t">关键判断</div>
+      <p style="margin-bottom:0">
+        <code>pkg/device/</code> 有 11,447 行，看着吓人 —— 但其中 <strong>12 个厂商后端是高度重复的</strong>：
+        每个都实现同一套 15 个方法，结构几乎一模一样。
+        你只需要精读 nvidia 一个（3,800 行），外加一个最简单的（比如 kunlun，约 400 行）做对照，
+        剩下 10 个扫一眼就懂。真正需要逐行读的核心只有大约 <b>5,000 行</b>。
+      </p>
+    </div>
+
+    <h3>三个二进制，三个战场</h3>
+
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:150px">二进制</th><th style="width:110px">部署形态</th><th style="width:180px">入口</th><th>职责</th></tr>
+      <tr>
+        <td><b>scheduler</b></td>
+        <td>Deployment<br>（集群里 1~N 个，选主）</td>
+        <td><span data-srcref="cmd/scheduler/main.go"></span></td>
+        <td>HTTP 服务，被 kube-scheduler 当作 extender 调用；同时跑 webhook 和节点注册循环</td>
+      </tr>
+      <tr>
+        <td>nvidia-device-plugin</td>
+        <td>DaemonSet<br>（每个 GPU 节点一个）</td>
+        <td><span data-srcref="cmd/device-plugin/nvidia/main.go"></span></td>
+        <td>向 kubelet 注册虚拟设备；把调度决策翻译成容器环境变量</td>
+      </tr>
+      <tr>
+        <td><b>vGPUmonitor</b></td>
+        <td>DaemonSet<br>（每个 GPU 节点一个）</td>
+        <td><span data-srcref="cmd/vGPUmonitor/main.go"></span></td>
+        <td>读容器共享内存里的用量，暴露 Prometheus 指标</td>
+      </tr>
+      <tr>
+        <td><i>libvgpu.so</i><br>（不是 Go）</td>
+        <td>挂进每个业务容器</td>
+        <td><span data-srcref="libvgpu/src/libvgpu.c"></span></td>
+        <td>C 语言写的 CUDA/NVML 劫持库，真正执行显存和算力限制</td>
+      </tr>
+    </table>
+    </div>
+
+    <h2>4. 你的第一个实验：把测试当调试器</h2>
+
+    <p>
+      这是整套教程<strong>最重要的一招</strong>。HAMi 的核心函数都是纯函数，
+      项目自带的表驱动测试就是最好的"交互式解释器"。
+    </p>
+
+    <h3>实验 4.1：跑通注解编解码测试</h3>
+
+    <div class="codeblock" data-lang="bash">
+<pre><code># 跑一个最简单的：容器设备注解的编解码
+go test ./pkg/device/ -run TestDecodeContainerDevices -v -count=1</code></pre>
+    </div>
+
+    <p>你应该看到一串 <code>--- PASS</code>。现在打开这个测试文件看看它测了什么：</p>
+
+    <div class="codeblock" data-lang="bash">
+<pre><code># 这个文件从第 49 行开始就是刚才跑的用例
+sed -n '49,120p' pkg/device/devices_test.go</code></pre>
+    </div>
+
+    <h3>实验 4.2：故意改坏一个用例，观察失败信息</h3>
+
+    <p>
+      这一步<strong>不要跳过</strong>。理解一个函数最快的方式，是看它"什么时候不工作"。
+    </p>
+
+    <ol class="steps">
+      <li>
+        <span class="st">打开 <code>pkg/device/devices_test.go</code>，找到 <code>TestDecodeContainerDevices</code></span>
+        里面有一堆 <code>{name: ..., args: ..., want: ...}</code> 结构的用例。
+      </li>
+      <li>
+        <span class="st">随便挑一个用例，把 <code>want</code> 里的某个数字改掉</span>
+        比如把期望的 <code>Usedmem: 1000</code> 改成 <code>1001</code>。
+      </li>
+      <li>
+        <span class="st">重新跑测试</span>
+        <div class="codeblock" data-lang="bash"><pre><code>go test ./pkg/device/ -run TestDecodeContainerDevices -v -count=1</code></pre></div>
+        失败信息会告诉你<strong>实际解析出来的值是什么</strong>。这就是这个函数真实的行为。
+      </li>
+      <li>
+        <span class="st">改回去，确认恢复 PASS</span>
+        <code>git checkout pkg/device/devices_test.go</code> 一键还原。
+      </li>
+    </ol>
+
+    <div class="note tip">
+      <div class="t">为什么这招管用</div>
+      <p style="margin-bottom:0">
+        读代码是"我猜它会这样"，跑测试是"它确实这样"。
+        HAMi 的 Fit 函数有十几个 continue 分支，光靠眼睛读，
+        你永远不确定某个条件到底会不会触发。改一个输入跑一次，2 秒就有答案。
+      </p>
+    </div>
+
+    <h3>实验 4.3：跑核心算法测试，感受一下规模</h3>
+
+    <div class="codeblock" data-lang="bash">
+<pre><code># 打分主流程（这个文件有 4600 行用例，是最完整的行为文档）
+go test ./pkg/scheduler/ -run Test_calcScore -count=1
+
+# NVIDIA 的 Fit 逐卡筛选
+go test ./pkg/device/nvidia/ -run TestDevices_Fit -count=1
+
+# 全项目单测 + 竞态检测（第一次会比较慢，几分钟）
+go test ./pkg/... -short -race -count=1</code></pre>
+    </div>
+
+    <div class="note warn">
+      <div class="t">关于 <code>-count=1</code></div>
+      <p style="margin-bottom:0">
+        Go 会缓存测试结果。改了代码但测试"秒过"且输出 <code>(cached)</code>，
+        说明它根本没重跑。养成永远带 <code>-count=1</code> 的习惯。
+      </p>
+    </div>
+
+    <h2>5. 读码三板斧</h2>
+
+    <p>后面每一章遇到"这段代码怎么跑的"，都靠这三招。</p>
+
+    <h3>第一斧：按签名搜索，30 秒定位</h3>
+
+    <p>
+      HAMi 命名很规整，接口方法名固定。想找"NVIDIA 的 Fit 在哪"：
+    </p>
+
+    <div class="codeblock" data-lang="bash">
+<pre><code># 找某个接口方法的所有实现（12 个后端都会出来）
+grep -rn ") Fit(" pkg/device/ --include=*.go | grep -v _test
+
+# 找某个结构体的所有方法
+grep -n "func (dev \*NvidiaGPUDevices)" pkg/device/nvidia/device.go
+
+# 找某个注解 key 在哪定义、在哪用
+grep -rn "hami.io/vgpu-node" --include=*.go .</code></pre>
+    </div>
+
+    <h3>第二斧：跟着测试读，而不是跟着 main 读</h3>
+
+    <p>
+      <code>main.go</code> 里全是 flag 解析和启动逻辑，信息密度很低。
+      真正的业务逻辑，测试文件读起来比源文件快得多，因为测试直接告诉你
+      "输入长这样，输出应该长这样"。
+    </p>
+
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:230px">想搞懂什么</th><th>就读哪个测试</th></tr>
+      <tr><td>注解字符串怎么编解码</td><td><span data-srcref="pkg/device/devices_test.go:49"></span></td></tr>
+      <tr><td>整个打分流程</td><td><span data-srcref="pkg/scheduler/score_test.go:77"></span>（<code>Test_calcScore</code>）</td></tr>
+      <tr><td>单卡到底怎么被筛掉的</td><td><span data-srcref="pkg/device/nvidia/device_test.go:826"></span>（<code>TestDevices_Fit</code>）</td></tr>
+      <tr><td>Webhook 改了 Pod 什么</td><td><span data-srcref="pkg/device/nvidia/device_test.go:45"></span>（<code>Test_MutateAdmission</code>）</td></tr>
+      <tr><td>节点注解怎么解析成设备列表</td><td><span data-srcref="pkg/device/devices_test.go:711"></span>（<code>Test_DecodeNodeDevices</code>）</td></tr>
+    </table>
+    </div>
+
+    <h3>第三斧：加日志，或者直接写个临时测试</h3>
+
+    <p>
+      HAMi 用 <code>klog</code>，日志分级。想看某个函数的详细过程，
+      不用改代码 —— 已有的 <code>klog.V(5)</code> 日志在测试里可以直接打开：
+    </p>
+
+    <div class="codeblock" data-lang="bash">
+<pre><code># -v=5 打开最详细的日志，能看到 Fit 里每张卡被拒的原因
+go test ./pkg/device/nvidia/ -run TestDevices_Fit -count=1 -args -v=5 2>&amp;1 | head -60</code></pre>
+    </div>
+
+    <p>或者更直接 —— 在包里新建一个 <code>scratch_test.go</code>，自己造数据调用它：</p>
+
+    <div class="codeblock" data-lang="go" data-title="pkg/device/scratch_test.go（自己新建，别提交）">
+<pre><code>package device
+
+import "testing"
+
+func TestScratch(t *testing.T) {
+	// 想搞懂 DecodeContainerDevices 对畸形输入怎么反应？直接问它
+	got, err := DecodeContainerDevices("GPU-abc,NVIDIA,3000,30:")
+	t.Logf("got=%+v err=%v", got, err)
+
+	got2, err2 := DecodeContainerDevices("坏数据没有逗号")
+	t.Logf("got2=%+v err2=%v", got2, err2)
+}</code></pre>
+    </div>
+
+    <div class="codeblock" data-lang="bash">
+<pre><code>go test ./pkg/device/ -run TestScratch -v -count=1
+# 用完记得删：rm pkg/device/scratch_test.go</code></pre>
+    </div>
+
+    <h2>6. 本章自测</h2>
+
+    <div class="quiz" data-answer="C">
+      <div class="q">HAMi 的三个进程之间，主要通过什么传递信息？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>gRPC 直连</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>共享一个 etcd 前缀，自己读写</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>Kubernetes 上 Pod 和 Node 的注解字符串</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>宿主机上的 Unix socket</span></div>
+      <div class="expl">
+        调度器把决策写进 Pod 注解，设备插件把节点设备清单写进 Node 注解，
+        双方都只跟 kube-apiserver 打交道，互不直连。
+        这个设计让每个组件都可以独立重启而不丢状态 —— 但也意味着<strong>注解格式就是它们的 API</strong>，
+        改格式是破坏性变更。下一章专门讲这个。
+        （设备插件确实用 gRPC，但那是跟 <i>kubelet</i> 通信，不是跟调度器。）
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="B">
+      <div class="q">想搞懂 <code>Fit()</code> 到底为什么拒绝了某张卡，最快的办法是？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>部署一套带 GPU 的 K8s 集群，提交 Pod 看 event</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>跑 <code>TestDevices_Fit</code>，改一个输入参数看输出怎么变</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>把 device.go 从头到尾读三遍</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>在 GitHub 上搜 issue</span></div>
+      <div class="expl">
+        <code>Fit</code> 是纯函数：给它一组 <code>DeviceUsage</code> 和一个请求，
+        它返回能不能放下 + 原因字符串。不需要集群，不需要 GPU，2 秒出结果。
+        A 太重，C 效率低（十几个 continue 分支光看很难确定哪个会触发），D 是补充手段。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="D">
+      <div class="q">下面哪个目录<strong>不值得</strong>在第一遍学习时逐行精读？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span><code>pkg/device/devices.go</code>（接口与数据结构）</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span><code>pkg/scheduler/score.go</code>（打分主流程）</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span><code>pkg/device/nvidia/device.go</code>（NVIDIA 后端）</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span><code>pkg/device/cambricon/</code>、<code>hygon/</code>、<code>metax/</code>… 等 11 个其他厂商后端</span></div>
+      <div class="expl">
+        这 11 个后端都实现同一套 <code>Devices</code> 接口，结构高度雷同。
+        精读 nvidia 一个 + 扫一个最简单的（如 <code>kunlun</code>）做对照就够了，
+        剩下的等你真要改某家硬件时再看。
+        把时间花在 A、B、C 上，那才是主干。
+      </div>
+    </div>
+
+    <h2>7. 小结</h2>
+
+    <ul>
+      <li>HAMi = <b>前台登记</b>（device plugin）+ <b>排房系统</b>（scheduler）+ <b>门禁</b>（HAMi-core），三者靠<b>注解字符串</b>传话。</li>
+      <li>真正需要精读的核心大约 <b>5,000 行</b>，不是 28,000 行。</li>
+      <li>核心逻辑全是纯函数，<b>用单元测试当调试器</b>，不需要集群不需要 GPU。</li>
+      <li>三板斧：<b>按签名 grep</b> 定位、<b>跟着测试读</b>、<b>加日志或写临时测试</b>验证。</li>
+    </ul>
+
+    <p class="next-hint">既然三个进程靠字符串通信，那就先把这串字符串弄清楚。
+        下一章你会亲手在浏览器里编解码 HAMi 的注解，看懂之后回头再读代码，会有种"原来如此"的感觉。</p>
+
+    <div class="chapter-nav" id="chapterNav"></div>
+  </main>
+</div>
+
+<script src="../assets/js/site.js"></script>
+<script>
+// ---- 代码量分布互动图 ----
+(function () {
+  const DATA = [
+    { name: 'pkg/device/',        loc: 11447, note: '设备抽象层 + 12 个厂商后端。核心是 devices.go（接口与数据结构，774 行），nvidia/ 占 3800 行，其余 11 家高度雷同。', ch: '第 02、05、10 章' },
+    { name: 'pkg/device-plugin/', loc: 7714,  note: 'NVIDIA 设备插件内部实现，从 NVIDIA 官方 k8s-device-plugin fork 改造而来。核心是 plugin/server.go（1245 行）的 ListAndWatch 和 Allocate。', ch: '第 08 章' },
+    { name: 'pkg/scheduler/',     loc: 3861,  note: '调度器扩展器。scheduler.go（1245 行）是 Filter/Bind 主流程，score.go（473 行）是打分，policy/ 是 binpack/spread 排序规则。真正的核心只有约 2000 行。', ch: '第 04、05、06 章' },
+    { name: 'cmd/',               loc: 2811,  note: '三个二进制的入口：flag 解析、组件启动、HTTP 路由注册。信息密度低，扫一遍知道有什么就行。', ch: '第 00、04 章' },
+    { name: 'pkg/monitor/ + cmd/vGPUmonitor', loc: 1957, note: '读容器共享内存里的 GPU 用量，暴露 Prometheus 指标。cudevshr.go 定义了跟 C 侧共享内存对齐的结构体。', ch: '第 09 章' },
+    { name: 'pkg/util/',          loc: 1558,  note: '共享工具：节点锁（基于注解的分布式锁，342 行，最值得读）、K8s client、选主、打分权重解析。', ch: '第 07 章' },
+    { name: 'libvgpu/src/',       loc: 0,     note: 'C 语言写的 CUDA/NVML 劫持库（HAMi-core），不算在 Go 行数里。核心：cuda/hook.c（dlsym 劫持）、cuda/memory.c（显存 OOM 检查）、multiprocess/（跨进程共享内存记账 + 算力令牌桶）。', ch: '第 09 章' },
+  ];
+  const max = Math.max.apply(null, DATA.map(d => d.loc));
+  const host = document.getElementById('locChart');
+  const out  = document.getElementById('locOut');
+  host.innerHTML = DATA.map((d, i) => {
+    const pct = d.loc ? Math.max(3, d.loc / max * 100) : 3;
+    const label = d.loc ? d.loc.toLocaleString() + ' 行' : 'C 代码';
+    return `<div class="devbar" data-i="${i}" style="cursor:pointer">
+      <div class="top"><span>${d.name}</span><span>${label}</span></div>
+      <div class="track"><i class="${d.loc ? 'new' : 'used'}" style="width:${pct}%"></i></div>
+    </div>`;
+  }).join('');
+  host.querySelectorAll('.devbar').forEach(bar => {
+    bar.addEventListener('click', () => {
+      const d = DATA[+bar.dataset.i];
+      out.innerHTML = `<span class="key">${d.name}</span>\n\n${d.note}\n\n<span class="ok">对应章节：${d.ch}</span>`;
+    });
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,845 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Device Plugin — HAMi 源码导读</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2316181d'/%3E%3Ctext x='16' y='23' font-size='17' font-family='monospace' font-weight='bold' fill='%23fff' text-anchor='middle'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main class="main">
+
+    <div class="page-kicker">第 08 章 · 第三阶段 硬骨头</div>
+    <h1 class="page-title">Device Plugin：把注解翻译成环境变量</h1>
+    <p class="page-lede">
+      场景切到 GPU 节点上。设备插件做两件事：
+      把 1 张物理卡上报成 10 张虚拟卡，
+      以及把调度器写的 Pod 注解翻译成容器里的环境变量。
+      后者是整个协议里最脆弱的一环。
+    </p>
+
+    <div class="goals">
+      <h3>学完这章你应该能</h3>
+      <ul>
+        <li>说清楚「一张卡变十张」是怎么骗过 kubelet 的，以及这个谎言的边界</li>
+        <li>解释 <code>Allocate()</code> 怎么知道「这次请求是给哪个 Pod 的」—— 以及为什么这很危险</li>
+        <li>列出注入到容器里的关键环境变量，说出每个的作用</li>
+        <li>解释注解「消费即擦除」的机制，以及它防的是什么</li>
+        <li>说清楚节点锁在设备插件这一侧是怎么被释放的</li>
+      </ul>
+    </div>
+
+    <h2>1. 设备插件的三个身份</h2>
+
+    <div class="flow">
+      <div class="node">
+        <div class="h">① 对 kubelet：一个标准 Device Plugin<span class="tag">gRPC</span></div>
+        <div class="d">
+          实现 K8s Device Plugin API：<code>ListAndWatch</code> 上报设备、
+          <code>GetPreferredAllocation</code> 建议选哪几个、<code>Allocate</code> 返回容器配置
+        </div>
+        <div class="src"><span data-srcref="pkg/device-plugin/nvidiadevice/nvinternal/plugin/server.go"></span></div>
+      </div>
+      <div class="arrow">＋</div>
+      <div class="node">
+        <div class="h">② 对调度器：一个设备清单上报器<span class="tag">Node 注解</span></div>
+        <div class="d">
+          每 30 秒调 NVML 扫一遍卡，把清单 JSON 写进 <code>hami.io/node-nvidia-register</code>
+        </div>
+        <div class="src"><span data-srcref="pkg/device-plugin/nvidiadevice/nvinternal/plugin/register.go:261"></span></div>
+      </div>
+      <div class="arrow">＋</div>
+      <div class="node">
+        <div class="h">③ 对容器：一个环境变量注入器<span class="tag">Allocate 响应</span></div>
+        <div class="d">
+          注入 <code>CUDA_DEVICE_MEMORY_LIMIT_0</code> 等，挂载 <code>libvgpu.so</code> 和 <code>ld.so.preload</code>
+        </div>
+      </div>
+    </div>
+
+    <h2>2. 「一张卡变十张」：善意的谎言</h2>
+
+    <div class="note">
+      <div class="t">对 kubelet 报的是切分后的虚拟设备</div>
+      <p style="margin-bottom:0">
+        kubelet 只懂「有几个设备可用」，不懂「显存分片」。
+        所以设备插件对 kubelet 撒了个谎：把一张 UUID 为 GPU-abc 的卡，
+        上报成 10 个 ID 分别为 <code>GPU-abc-0</code> … <code>GPU-abc-9</code> 的「设备」。
+        <br><br>
+        kubelet 于是可以像分配普通资源一样，把「10 个设备」分给 10 个容器。
+        至于每个容器实际能用多少显存 —— 那是 HAMi-core 在容器里管的事（第 09 章）。
+      </p>
+    </div>
+
+    <div class="codeblock" data-file="pkg/device-plugin/nvidiadevice/nvinternal/plugin/server.go" data-start="621" data-lang="go" data-hl="2-6,8-11,12-14,16-19">
+<pre><code>func (plugin *NvidiaDevicePlugin) ListAndWatch(e *kubeletdevicepluginv1beta1.Empty, s kubeletdevicepluginv1beta1.DevicePlugin_ListAndWatchServer) error {
+	err := s.Send(&amp;kubeletdevicepluginv1beta1.ListAndWatchResponse{Devices: plugin.apiDevices()})
+	if err != nil {
+		klog.Errorf("Failed to send ListAndWatch response: %v", err)
+		return err
+	}
+
+	for {
+		select {
+		case &lt;-plugin.stop:
+			return nil
+		case d := &lt;-plugin.health:                  // 健康状态变化才重新上报
+			// FIXME: there is no way to recover from the Unhealthy state.
+			d.Health = kubeletdevicepluginv1beta1.Unhealthy
+			klog.Infof("'%s' device marked unhealthy: %s", plugin.rm.Resource(), d.ID)
+			if err := s.Send(&amp;kubeletdevicepluginv1beta1.ListAndWatchResponse{Devices: plugin.apiDevices()}); err != nil {
+				klog.Errorf("Failed to send health-update ListAndWatch response: %v", err)
+				return nil
+			}
+		}
+	}
+}</code></pre>
+    </div>
+
+    <div class="note trap">
+      <div class="t">注意那个 <code>FIXME</code></div>
+      <p style="margin-bottom:0">
+        <em>「there is no way to recover from the Unhealthy state」</em> ——
+        一张卡一旦被标记为不健康，<strong>就再也回不到健康状态了</strong>，
+        除非重启设备插件 Pod。
+        <br>如果是临时性的 XID 错误（比如 ECC 可纠正错误），
+        这张卡就被永久浪费了。
+        <br><em>这是一个开发者自己标注的已知缺陷。修它需要在
+        <span data-srcref="pkg/device-plugin/nvidiadevice/nvinternal/rm/health.go"></span>
+        里加上恢复检测逻辑 —— 是个有分量的贡献。</em>
+      </p>
+    </div>
+
+    <h2>3. 设备清单上报：Node 注解从哪来</h2>
+
+    <p>第 01 章讲的那条 <code>hami.io/node-nvidia-register</code> 注解，就是这里写的：</p>
+
+    <div class="codeblock" data-file="pkg/device-plugin/nvidiadevice/nvinternal/plugin/register.go" data-start="261" data-lang="go" data-hl="2-6,14-19,21-24,44-48,50-56">
+<pre><code>func (plugin *NvidiaDevicePlugin) RegisterInAnnotation() (bool, error) {
+	devices, err := plugin.getAPIDevices()            // 调 NVML 扫描
+	if err != nil {
+		klog.ErrorS(err, "failed to get API devices")
+		return false, err
+	}
+
+	// Log compact summary at V(3); full details at V(5)
+	klog.V(3).Infof("Discovered %d device(s) for registration", len(*devices))
+	klog.V(5).InfoS("Device details", "devices", devices)
+
+	annos := make(map[string]string)
+	node, err := util.GetNode(util.NodeName)
+	if err != nil {
+		klog.Errorln("get node error", err.Error())
+		return false, err
+	}
+	encodeddevices := device.MarshalNodeDevices(*devices)   // JSON 编码（第 01 章）
+	if encodeddevices == plugin.deviceCache {
+		klog.V(3).Info("Device info unchanged, skipping annotation update")
+		return false, nil                             // 内容没变就不写，省 apiserver 压力
+	}
+
+	var data []byte
+	if os.Getenv("ENABLE_TOPOLOGY_SCORE") == "true" {
+		gpuScore, hasAsymmetry, err := calculateGPUScore(device.GetDevicesUUIDList(*devices))
+		...
+		if hasAsymmetry {
+			util.EmitNodeWarningEvent(node, "AsymmetricGPUP2PLink",
+				"One or more GPU pairs on this node have asymmetric P2P link data; "+
+					"affected pairs scored 0 (possible NVLink hardware or driver issue)",
+				time.Hour)
+		}
+		data, err = json.Marshal(gpuScore)
+		...
+	}
+	klog.V(4).InfoS("patch nvidia topo score to node", "hami.io/node-nvidia-score", string(data))
+	annos[nvidia.RegisterAnnos] = encodeddevices                    // hami.io/node-nvidia-register
+	if len(data) &gt; 0 {
+		annos[nvidia.RegisterGPUPairScore] = string(data)           // hami.io/node-nvidia-score
+	}
+	klog.Infof("Updating node annotations with %d device(s)", len(*devices))
+	err = util.PatchNodeAnnotations(node, annos)
+	if err != nil {
+		klog.Errorln("patch node error", err.Error())
+		util.EmitNodeWarningEvent(node, "RegistrationFailed",
+			fmt.Sprintf("Failed to patch node annotation: %v", err),
+			10*time.Minute)
+		return true, err
+	}
+	plugin.deviceCache = encodeddevices               // 缓存住，下次比对
+	return true, nil
+}</code></pre>
+    </div>
+
+    <div class="note tip">
+      <div class="t">两个实现细节</div>
+      <ul style="margin-bottom:0">
+        <li><b>内容对比去重</b>（<code>plugin.deviceCache</code>）：设备清单 30 秒扫一次，
+            但绝大多数时候内容不变。不写就不产生 apiserver 请求，也不会触发调度器那边的 informer 事件。
+            <strong>在大集群里这个优化很关键。</strong></li>
+        <li>限频的 Warning Event：<code>EmitNodeWarningEvent(..., time.Hour)</code>、
+            <code>10*time.Minute</code>。带了去重窗口，
+            避免每 30 秒刷一条相同的事件把 etcd 淹了。</li>
+      </ul>
+    </div>
+
+    <h3>3.1 显存查不到怎么办</h3>
+
+    <div class="codeblock" data-file="pkg/device-plugin/nvidiadevice/nvinternal/plugin/register.go" data-start="123" data-lang="go" data-hl="1-5,6-9,10-16">
+<pre><code>		memoryTotal := 0
+		memory, ret := ndev.GetMemoryInfo()
+		switch ret {
+		case nvml.SUCCESS:
+			memoryTotal = int(memory.Total)
+		case nvml.ERROR_NOT_SUPPORTED:
+			// Unified memory architecture GPUs (e.g., NVIDIA GB10/DGX Spark) don't support
+			// traditional memory queries. Use PreConfiguredDeviceMemory from config as fallback.
+			if plugin.schedulerConfig.PreConfiguredDeviceMemory != nil &amp;&amp; *plugin.schedulerConfig.PreConfiguredDeviceMemory &gt; 0 {
+				memoryTotal = int(*plugin.schedulerConfig.PreConfiguredDeviceMemory) * 1024 * 1024
+				klog.Warningf("GetMemoryInfo not supported for device %s, using configured PreConfiguredDeviceMemory: %d MB", ...)
+			} else {
+				klog.Errorf("GetMemoryInfo not supported for device %s (unified memory architecture) "+
+					"and PreConfiguredDeviceMemory not configured. Skipping this device. "+
+					"Set 'preConfiguredDeviceMemory' in nvidia config to the total GPU memory in MB.", UUID)
+				continue                              // 查不到又没配 → 跳过这张卡
+			}</code></pre>
+    </div>
+
+    <p>
+      统一内存架构的卡（GB10 / DGX Spark）查不到显存总量，需要人工配置。
+      那条 error 日志把解决办法也写进去了：既说哪里出错，也说该配哪个字段。
+    </p>
+
+    <h2>4. Allocate()：整个协议最脆弱的地方</h2>
+
+    <div class="note trap">
+      <div class="t">核心难题：kubelet 不告诉你这是给哪个 Pod 的</div>
+      <p style="margin-bottom:0">
+        K8s Device Plugin API 的 <code>AllocateRequest</code> 里<strong>只有设备 ID 列表</strong>，
+        没有 Pod 名、没有命名空间、没有 UID。
+        <br>但 HAMi 必须知道是哪个 Pod，才能读出调度器写的分配注解。
+        <br>怎么办？去 apiserver 上「猜」。
+      </p>
+    </div>
+
+    <div class="codeblock" data-file="pkg/util/util.go" data-start="76" data-lang="go" data-hl="2-6,8-13,15-16,18-20,21-30,32-38,40">
+<pre><code>func GetPendingPod(ctx context.Context, node string) (*corev1.Pod, error) {
+	pod, err := GetAllocatePodByNode(ctx, node)       // 先看 Node 注解里有没有明确指定
+	if err != nil {
+		return nil, err
+	}
+	if pod != nil {
+		return pod, nil
+	}
+	// filter pods for this node.
+	selector := fmt.Sprintf("spec.nodeName=%s", node)
+	podListOptions := metav1.ListOptions{
+		FieldSelector: selector,
+	}
+	podlist, err := client.GetClient().CoreV1().Pods("").List(ctx, podListOptions)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range podlist.Items {
+		if p.Status.Phase != corev1.PodPending {
+			continue                                   // ① 必须是 Pending
+		}
+		if _, ok := p.Annotations[BindTimeAnnotations]; !ok {
+			continue                                   // ② 必须有 bind-time
+		}
+		if phase, ok := p.Annotations[DeviceBindPhase]; !ok {
+			continue                                   // ③ 必须有 bind-phase
+		} else {
+			// Allow both "allocating" and "success" phases for multi-container pods
+			// where some containers have already been allocated but others are still pending
+			if phase != DeviceBindAllocating &amp;&amp; phase != DeviceBindSuccess {
+				continue
+			}
+		}
+		if n, ok := p.Annotations[AssignedNodeAnnotations]; !ok {
+			continue                                   // ④ vgpu-node 必须等于本节点
+		} else {
+			if strings.Compare(n, node) == 0 {
+				return &amp;p, nil                         // 就是你了
+			}
+		}
+	}
+	return nil, fmt.Errorf("no binding pod found on node %s", node)
+}</code></pre>
+    </div>
+
+    <div class="lab">
+      <header>getPendingPod 猜谁模拟器<span class="badge">互动</span></header>
+      <div class="body">
+        <p style="font-size:13.5px;color:var(--fg-soft);margin-bottom:12px">
+          节点上有多个 Pod，看筛选条件怎么一层层过滤。试试让两个 Pod 同时满足条件，
+          看会发生什么。
+        </p>
+        <div id="pendCtl"></div>
+        <div class="out" id="pendOut"></div>
+      </div>
+    </div>
+
+    <div class="note trap">
+      <div class="t">这个设计的两个致命隐患</div>
+      <ol style="margin-bottom:0">
+        <li>
+          如果有两个 Pod 同时满足条件，会选到列表里的第一个 —— 而 List 的顺序是不保证的。
+          结果就是 Pod A 拿到了 Pod B 的显存配置。
+          <br><strong>唯一的防线是节点锁</strong>（第 06 章）：它保证同一时刻只有一个 Pod 处于 <code>allocating</code>。
+          <br>但注意条件 ③ 里 <code>DeviceBindSuccess</code> 也被接受了 ——
+          注释解释是为了多容器 Pod，但这也<strong>扩大了误配的窗口</strong>。
+        </li>
+        <li>
+          每次 Allocate 都要 List 全节点的 Pod，是一次实打实的 apiserver 请求。
+          节点上 Pod 密集时这是热点。
+        </li>
+      </ol>
+    </div>
+
+    <h3>4.1 Allocate 主流程</h3>
+
+    <div class="codeblock" data-file="pkg/device-plugin/nvidiadevice/nvinternal/plugin/server.go" data-start="852" data-lang="go" data-hl="2-6,11-16,18-22,24">
+<pre><code>func (plugin *NvidiaDevicePlugin) Allocate(ctx context.Context, reqs *kubeletdevicepluginv1beta1.AllocateRequest) (*kubeletdevicepluginv1beta1.AllocateResponse, error) {
+	// Kubelet may issue Allocate calls concurrently. The pending-pod
+	// annotation protocol and dynamic MIG preparation are node-global, so keep
+	// pod selection, GI/CI creation, and annotation consumption atomic.
+	plugin.applyMutex.Lock()                          // 节点内串行化
+	defer plugin.applyMutex.Unlock()
+
+	klog.InfoS("Allocate", "request", reqs)
+	responses := kubeletdevicepluginv1beta1.AllocateResponse{}
+	nodename := os.Getenv(util.NodeNameEnvName)
+	current, err := getPendingPod(ctx, nodename)      // 猜是给哪个 Pod 的
+	if err != nil {
+		//nodelock.ReleaseNodeLock(nodename, NodeLockNvidia, current)
+		return &amp;kubeletdevicepluginv1beta1.AllocateResponse{}, err
+	}
+	klog.Infof("Allocate pod name is %s/%s, annotation is %+v", current.Namespace, current.Name, current.Annotations)
+
+	podSingleDev, err := decodePodSingleDevice(nvidia.NvidiaGPUDevice, current)  // 解析注解
+	if err != nil {
+		PodAllocationFailed(nodename, current, NodeLockNvidia)    // 失败要放锁
+		return &amp;kubeletdevicepluginv1beta1.AllocateResponse{}, err
+	}
+
+	for idx, req := range reqs.ContainerRequests {
+		...
+	}</code></pre>
+    </div>
+
+    <div class="note warn">
+      <div class="t"><code>plugin.applyMutex</code> 那段注释值得细读</div>
+      <p style="margin-bottom:0">
+        <em>「Kubelet may issue Allocate calls concurrently.」</em> ——
+        kubelet 可能并发调 Allocate。而「猜 Pod」+「消费注解」+「MIG 实例创建」
+        这三件事都是<strong>节点全局</strong>的操作，必须原子完成。
+        <br>所以这里加了一把<strong>整个设备插件进程级的大锁</strong>。
+        代价是同节点的容器分配完全串行 —— 但正确性优先。
+      </p>
+    </div>
+
+    <h3>4.2 「消费即擦除」</h3>
+
+    <p>
+      注解里按容器顺序排着好几份分配。每处理一个容器，就<strong>把对应那一段清空</strong>：
+    </p>
+
+    <div class="codeblock" data-file="pkg/device-plugin/nvidiadevice/nvinternal/plugin/util.go" data-start="106" data-lang="go" data-hl="1-6,9-13,14-16,18-22">
+<pre><code>// popNextContainerDevices finds and erases the first non-empty ContainerDevices
+// from podSingleDev in place, returning the corresponding pod container and the
+// popped devices. The container resolution uses the same init-then-regular
+// ordering convention as the annotation encoder. It does NOT touch the API
+// server — the caller is responsible for patching the annotation once after the
+// loop completes.
+func popNextContainerDevices(pod *corev1.Pod, podSingleDev device.PodSingleDevice) (corev1.Container, device.ContainerDevices, error) {
+	initContainerCount := len(pod.Spec.InitContainers)
+	for i, ctrDevs := range podSingleDev {
+		if len(ctrDevs) &gt; 0 {                          // 找第一个非空的
+			podSingleDev[i] = device.ContainerDevices{} // 就地擦除
+			if i &lt; initContainerCount {
+				return pod.Spec.InitContainers[i], ctrDevs, nil     // init 容器
+			}
+			regularIdx := i - initContainerCount        // 减去偏移量
+			if regularIdx &gt;= len(pod.Spec.Containers) {
+				return corev1.Container{}, nil, fmt.Errorf("container index %d out of range (init=%d, regular=%d)", i, initContainerCount, len(pod.Spec.Containers))
+			}
+			return pod.Spec.Containers[regularIdx], ctrDevs, nil    // 普通容器
+		}
+	}
+	return corev1.Container{}, nil, errors.New("no pending device allocation found")
+}</code></pre>
+    </div>
+
+    <div class="note">
+      <div class="t">这里印证了第 01 章说的「空容器也要占位」</div>
+      <p style="margin-bottom:0">
+        <code>i</code> 是注解里的<strong>容器序号</strong>，
+        <code>i &lt; initContainerCount</code> 决定它是 init 还是普通容器，
+        <code>i - initContainerCount</code> 是普通容器的下标。
+        <br>如果编码时跳过了不用 GPU 的容器，这里的索引换算就全错了。第 3 个容器会拿到第 1 个容器的卡。这就是为什么必须编码成 <code>;;</code> 保留空位。
+      </p>
+    </div>
+
+    <div class="codeblock" data-file="pkg/device-plugin/nvidiadevice/nvinternal/plugin/util.go" data-start="130" data-lang="go" data-hl="1-4,6-14">
+<pre><code>// patchErasedAnnotation patches the pod's device annotation with the given
+// podSingleDev (which has had some containers popped). It also updates
+// pod.Annotations in place so that subsequent Allocate calls within the same
+// kubelet invocation see the erased state.
+func patchErasedAnnotation(pod *corev1.Pod, dtype string, podSingleDev device.PodSingleDevice) error {
+	klog.V(5).Infof("After erase annotation, remaining devices: %v", podSingleDev)
+	encoded := device.EncodePodSingleDevice(podSingleDev)
+	annoKey := device.InRequestDevices[dtype]          // hami.io/vgpu-devices-to-allocate
+	newAnnos := map[string]string{annoKey: encoded}
+	if err := util.PatchPodAnnotations(pod, newAnnos); err != nil {
+		return err
+	}
+	pod.Annotations[annoKey] = encoded                 // 内存里也同步更新
+	return nil
+}</code></pre>
+    </div>
+
+    <div class="note tip">
+      <div class="t">为什么要「擦除」：防止容器重启时重复分配</div>
+      <p style="margin-bottom:0">
+        容器崩溃重启时，kubelet 会<strong>再次调用 Allocate</strong>。
+        如果注解还在，插件会以为这是一个新容器，
+        <strong>把同一份显存再分配一次</strong>。
+        <br>擦除之后，<code>to-allocate</code> 变空，
+        但 <code>allocated</code>（第 01 章说的「留档」那条）<strong>保持不变</strong>，
+        调度器的账本依然正确。两条注解各司其职的价值就体现在这里。
+      </p>
+    </div>
+
+    <h3>4.3 注入环境变量</h3>
+
+    <div class="codeblock" data-file="pkg/device-plugin/nvidiadevice/nvinternal/plugin/server.go" data-start="937" data-lang="go" data-hl="2-6,7,8,9-11,12-14,15-17,19-24">
+<pre><code>			if plugin.operatingMode != "mig" {
+				for i, dev := range devreq {
+					limitKey := fmt.Sprintf("CUDA_DEVICE_MEMORY_LIMIT_%v", i)
+					response.Envs[limitKey] = fmt.Sprintf("%vm", dev.Usedmem)      // 显存上限
+				}
+				response.Envs["CUDA_DEVICE_SM_LIMIT"] = fmt.Sprint(devreq[0].Usedcores)   // 算力上限
+				response.Envs["CUDA_DEVICE_MEMORY_SHARED_CACHE"] = fmt.Sprintf("%s/vgpu/%v.cache", hostHookPath, uuid.New().String())
+				if *plugin.schedulerConfig.DeviceMemoryScaling &gt; 1 {
+					response.Envs["CUDA_OVERSUBSCRIBE"] = "true"                   // 显存超卖开关
+				}
+				if *plugin.schedulerConfig.LogLevel != "" {
+					response.Envs["LIBCUDA_LOG_LEVEL"] = string(*plugin.schedulerConfig.LogLevel)
+				}
+				if plugin.schedulerConfig.DisableCoreLimit {
+					response.Envs[util.CoreLimitSwitch] = "disable"                // 关闭算力限制
+				}
+				cacheFileHostDirectory := fmt.Sprintf("%s/vgpu/containers/%s_%s", hostHookPath, current.UID, currentCtr.Name)
+				os.RemoveAll(cacheFileHostDirectory)
+				os.MkdirAll(cacheFileHostDirectory, 0777)
+				os.Chmod(cacheFileHostDirectory, 0777)
+				...</code></pre>
+    </div>
+
+    <div class="lab">
+      <header>环境变量注入器<span class="badge">互动</span></header>
+      <div class="body">
+        <p style="font-size:13.5px;color:var(--fg-soft);margin-bottom:12px">
+          输入调度器写的注解，看容器里最终会拿到什么环境变量和挂载。
+        </p>
+        <label class="f">hami.io/vgpu-devices-to-allocate（当前容器那一段）</label>
+        <input type="text" id="envAnno" value="GPU-aaa,NVIDIA,3000,30:GPU-bbb,NVIDIA,3000,30:">
+        <div class="field-row" style="margin-top:10px">
+          <div><label class="f">DeviceMemoryScaling</label><input type="number" id="envScale" value="1" step="0.5"></div>
+          <div><label class="f">DisableCoreLimit</label>
+            <select id="envDisable"><option value="false">false</option><option value="true">true</option></select></div>
+          <div><label class="f">LogLevel</label>
+            <select id="envLog"><option value="">（未设置）</option><option value="1">1 warnings</option><option value="4">4 debug</option></select></div>
+        </div>
+        <div class="out" id="envOut"></div>
+      </div>
+    </div>
+
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:280px">环境变量</th><th>作用</th><th style="width:120px">谁消费</th></tr>
+      <tr><td><code>CUDA_DEVICE_MEMORY_LIMIT_0/1/…</code></td><td>第 N 张卡的显存上限，形如 <code>3000m</code></td><td>HAMi-core</td></tr>
+      <tr><td><code>CUDA_DEVICE_SM_LIMIT</code></td><td>算力百分比上限（令牌桶速率）</td><td>HAMi-core</td></tr>
+      <tr><td><code>CUDA_DEVICE_MEMORY_SHARED_CACHE</code></td><td>跨进程共享内存文件路径，用于同容器多进程的用量记账</td><td>HAMi-core + vGPUmonitor</td></tr>
+      <tr><td><code>CUDA_OVERSUBSCRIBE</code></td><td>允许显存超卖（用主机内存兜底）</td><td>HAMi-core</td></tr>
+      <tr><td><code>GPU_CORE_UTILIZATION_POLICY</code></td><td><code>default</code> / <code>force</code> / <code>disable</code></td><td>HAMi-core</td></tr>
+      <tr><td><code>LIBCUDA_LOG_LEVEL</code></td><td>劫持库日志级别，排障用</td><td>HAMi-core</td></tr>
+      <tr><td><code>CUDA_TASK_PRIORITY</code></td><td>任务优先级（webhook 注入的，第 03 章）</td><td>HAMi-core</td></tr>
+      <tr><td><code>NVIDIA_VISIBLE_DEVICES</code></td><td>让 nvidia-container-runtime 只挂对应的物理卡</td><td>容器运行时</td></tr>
+    </table>
+    </div>
+
+    <h3>4.4 挂载劫持库</h3>
+
+    <p>
+      光有环境变量不够，还要把 <code>libvgpu.so</code> 挂进容器，
+      并通过 <code>/etc/ld.so.preload</code> 让它在任何程序启动时被优先加载：
+    </p>
+
+    <div class="codeblock" data-file="lib/nvidia/ld.so.preload" data-lang="text">
+<pre><code>/usr/local/vgpu/libvgpu.so</code></pre>
+    </div>
+
+    <div class="note analogy">
+      <div class="t">换掉门口的接待员</div>
+      <p style="margin-bottom:0">
+        <code>ld.so.preload</code> 是 Linux 动态链接器的一个机制：
+        里面列出的 .so 会在所有其他库之前被加载。
+        <br>于是当应用调用 <code>cuMemAlloc()</code> 时，
+        动态链接器先在 libvgpu.so 里找到这个符号，
+        应用以为自己在调 CUDA，其实调的是 HAMi 的劫持函数。
+        <br>劫持函数检查完额度，再转发给真正的 <code>libcuda.so</code>。
+        <br>—— 第 09 章会详细拆这个机制。
+      </p>
+    </div>
+
+    <h2>5. 释放节点锁：闭环的最后一步</h2>
+
+    <div class="codeblock" data-file="pkg/device-plugin/nvidiadevice/nvinternal/plugin/util.go" data-start="367" data-lang="go" data-hl="1-4,6-15,17-20,22-24">
+<pre><code>func PodAllocationSuccess(nodeName string, pod *corev1.Pod, lockName string) {
+	klog.Infof("Pod allocation successful for pod %s/%s on node %s", pod.Namespace, pod.Name, nodeName)
+	updatePodAnnotationsAndReleaseLock(nodeName, pod, lockName, util.DeviceBindSuccess)
+}
+
+func updatePodAnnotationsAndReleaseLock(nodeName string, pod *corev1.Pod, lockName string, deviceBindPhase string) {
+	newAnnos := map[string]string{util.DeviceBindPhase: deviceBindPhase}
+	if err := util.PatchPodAnnotations(pod, newAnnos); err != nil {
+		klog.Errorf("Failed to patch pod annotations for pod %s/%s: %v", pod.Namespace, pod.Name, err)
+	}
+	if err := nodelock.ReleaseNodeLock(nodeName, lockName, pod, false); err != nil {   // 放锁
+		klog.Errorf("Failed to release node lock for node %s and lock %s: %v", nodeName, lockName, err)
+	}
+}
+
+var podAllocationFailed = func(nodeName string, pod *corev1.Pod, lockName string) {
+	klog.Infof("Pod allocation failed for pod %s/%s on node %s", pod.Namespace, pod.Name, nodeName)
+	updatePodAnnotationsAndReleaseLock(nodeName, pod, lockName, util.DeviceBindFailed)
+}
+
+func PodAllocationFailed(nodeName string, pod *corev1.Pod, lockName string) {
+	podAllocationFailed(nodeName, pod, lockName)
+}</code></pre>
+    </div>
+
+    <div class="note tip">
+      <div class="t"><code>var podAllocationFailed = func(...)</code> 这个写法是为了测试</div>
+      <p style="margin-bottom:0">
+        它被声明成<strong>包级变量而不是普通函数</strong>，
+        这样测试里可以直接替换掉它（<code>podAllocationFailed = func(...) { called = true }</code>），
+        验证「某个错误分支有没有正确释放锁」。
+        <br>这是 Go 里做<strong>轻量级依赖注入</strong>的常用手法，
+        比引入 mock 框架简单得多。<code>getPendingPod = util.GetPendingPod</code>
+        （<span data-srcref="pkg/device-plugin/nvidiadevice/nvinternal/plugin/server.go:84"></span>）也是同样的套路。
+      </p>
+    </div>
+
+    <div class="note trap">
+      <div class="t">找找看：哪条错误路径漏了放锁？</div>
+      <p style="margin-bottom:0">
+        <code>Allocate()</code> 里几乎每个 <code>return err</code> 前面都跟着
+        <code>PodAllocationFailed(...)</code>。但<strong>第一个不是</strong>：
+      </p>
+      <div class="codeblock" data-lang="go" data-title="server.go:862">
+<pre><code>	current, err := getPendingPod(ctx, nodename)
+	if err != nil {
+		//nodelock.ReleaseNodeLock(nodename, NodeLockNvidia, current)   ← 被注释掉了
+		return &amp;kubeletdevicepluginv1beta1.AllocateResponse{}, err
+	}</code></pre>
+      </div>
+      <p style="margin-bottom:0">
+        逻辑上说得通：连是哪个 Pod 都不知道，没法定向放锁。
+        结果是这条路径只能等 5 分钟锁超时。
+        <br><em>被注释掉的代码 + 没有解释的注释，通常意味着「这里有个已知问题但没想好怎么修」。
+        这是找贡献机会的经典信号 —— 但动手前先去 issue 里搜一下，可能已经有人讨论过。</em>
+      </p>
+    </div>
+
+    <h2>6. 完整时序回顾</h2>
+
+    <div class="codeblock" data-lang="text" data-title="从 Bind 到容器跑起来">
+<pre><code>调度器                          apiserver                    设备插件                   kubelet
+   │                                │                            │                        │
+   │ ① LockNode                     │                            │                        │
+   ├───── patch node annotation ───►│                            │                        │
+   │      hami.io/mutex.lock        │                            │                        │
+   │                                │                            │                        │
+   │ ② patch bind-phase=allocating  │                            │                        │
+   ├───────────────────────────────►│                            │                        │
+   │                                │                            │                        │
+   │ ③ Bind(pod → node)             │                            │                        │
+   ├───────────────────────────────►│                            │                        │
+   │                                │                            │      ④ 拉起 Pod         │
+   │                                │                            │◄───────────────────────┤
+   │                                │                            │  Allocate(deviceIDs)   │
+   │                                │◄── ⑤ List pending pods ────┤                        │
+   │                                │    找 bind-phase=allocating│                        │
+   │                                │                            │                        │
+   │                                │◄── ⑥ patch to-allocate ────┤  消费即擦除             │
+   │                                │        (擦掉本容器那段)     │                        │
+   │                                │                            │  ⑦ 返回 Envs + Mounts  │
+   │                                │                            ├───────────────────────►│
+   │                                │◄── ⑧ bind-phase=success ───┤                        │
+   │                                │◄── ⑨ 删除 mutex.lock ──────┤  ReleaseNodeLock        │
+   │                                │                            │                        │
+   │                                │                            │      ⑩ 容器启动         │
+   │                                │                            │      ld.so.preload      │
+   │                                │                            │      → libvgpu.so 生效  │</code></pre>
+    </div>
+
+    <h2>7. 动手实验</h2>
+
+    <ol class="steps">
+      <li>
+        <span class="st">跑设备插件的测试</span>
+        <div class="codeblock" data-lang="bash"><pre><code>go test ./pkg/device-plugin/... -count=1
+grep -n "^func Test" pkg/device-plugin/nvidiadevice/nvinternal/plugin/server_test.go | head -20</code></pre></div>
+      </li>
+      <li>
+        <span class="st">重点看「消费即擦除」的测试</span>
+        <div class="codeblock" data-lang="bash"><pre><code>go test ./pkg/device-plugin/nvidiadevice/nvinternal/plugin/ -run "TestPopNext|TestPatchErased" -v -count=1
+grep -n "popNextContainerDevices\|patchErasedAnnotation" pkg/device-plugin/nvidiadevice/nvinternal/plugin/util_test.go</code></pre></div>
+      </li>
+      <li>
+        <span class="st">看 alloc 重构后的测试（覆盖各种失败路径）</span>
+        <div class="codeblock" data-lang="bash"><pre><code>cat pkg/device-plugin/nvidiadevice/nvinternal/plugin/alloc_refactor_test.go | head -60</code></pre></div>
+      </li>
+      <li>
+        <span class="st">在真实集群里观察一次完整分配</span>
+        <div class="codeblock" data-lang="bash"><pre><code># 提交一个 GPU Pod，然后快速连续观察注解变化
+kubectl get pod &lt;pod&gt; -o jsonpath='{.metadata.annotations}' | python -m json.tool
+
+# 进容器看环境变量
+kubectl exec &lt;pod&gt; -- env | grep -i "CUDA\|LIBCUDA\|NVIDIA"
+
+# 看劫持库有没有挂上
+kubectl exec &lt;pod&gt; -- cat /etc/ld.so.preload
+kubectl exec &lt;pod&gt; -- ls -la /usr/local/vgpu/</code></pre></div>
+      </li>
+      <li>
+        <span class="st">审计一遍：哪些 return 路径没放锁</span>
+        <div class="codeblock" data-lang="bash"><pre><code>grep -n "return.*err\|PodAllocationFailed" pkg/device-plugin/nvidiadevice/nvinternal/plugin/server.go | sed -n '/85[0-9]/,/105[0-9]/p'
+# 数一数 return 和 PodAllocationFailed 的配对情况</code></pre></div>
+      </li>
+    </ol>
+
+    <h2>8. 本章自测</h2>
+
+    <div class="quiz" data-answer="C">
+      <div class="q">设备插件的 <code>Allocate()</code> 怎么知道这次请求是给哪个 Pod 的？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>kubelet 在 AllocateRequest 里传了 Pod UID</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>从设备 ID 反查</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>去 apiserver List 本节点的 Pod，找 <code>bind-phase=allocating</code> 且 <code>vgpu-node</code> 等于本节点的那个</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>通过 CRI socket 问容器运行时</span></div>
+      <div class="expl">
+        K8s Device Plugin API 的 <code>AllocateRequest</code> 里
+        只有设备 ID 列表，没有任何 Pod 信息（这是 API 设计的历史遗留）。
+        HAMi 只能靠注解组合去「猜」。
+        <br><strong>这是整个协议最脆弱的地方</strong>：如果两个 Pod 同时满足条件，
+        会选到 List 返回的第一个，而顺序不保证 → 配置串台。
+        <br>节点锁的全部意义就是保证「同一时刻只有一个 Pod 处于 allocating」。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="B">
+      <div class="q">为什么 <code>Allocate()</code> 处理完一个容器后要把注解里对应那段<strong>擦掉</strong>？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>为了节省 etcd 空间</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>容器崩溃重启时 kubelet 会再次调 Allocate，不擦除会导致同一份显存被重复分配</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>为了触发调度器的 informer 事件</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>为了让 vGPUmonitor 知道分配完成了</span></div>
+      <div class="expl">
+        擦的是 <code>hami.io/vgpu-devices-to-allocate</code>（「工单」），
+        而 <code>hami.io/vgpu-devices-allocated</code>（「留档」）保持不变，
+        所以<strong>调度器的账本不受影响</strong>。
+        <br>这就是第 01 章讲的「两条注解各司其职」的价值：
+        一条是<b>待办事项</b>（消费即销毁），一条是<b>事实记录</b>（永久保留）。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="A">
+      <div class="q">一个 Pod 有 1 个 InitContainer（用 GPU）、2 个普通容器（第 1 个用 GPU，第 2 个不用）。注解是 <code>{init};{ctr0};;</code>。<code>popNextContainerDevices</code> 第二次被调用时，<code>i=1</code>，它返回哪个容器？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span><code>pod.Spec.Containers[0]</code>，因为 <code>i - initContainerCount = 1 - 1 = 0</code></span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span><code>pod.Spec.Containers[1]</code></span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span><code>pod.Spec.InitContainers[1]</code></span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>报错，索引越界</span></div>
+      <div class="expl">
+        <code>i=1</code>，<code>initContainerCount=1</code>，
+        所以 <code>i &lt; initContainerCount</code> 不成立 → 走普通容器分支，
+        <code>regularIdx = 1 - 1 = 0</code> → <code>pod.Spec.Containers[0]</code>。
+        <br>这个索引换算依赖「注解里每个容器都占一个位置，包括不用 GPU 的」。
+        如果编码时跳过空容器，这里就会全部错位 —— 这就是第 01 章强调「空容器也要占位」的原因。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="D">
+      <div class="q">容器里的应用调用 <code>cudaMalloc(4GB)</code>，而 <code>CUDA_DEVICE_MEMORY_LIMIT_0=3000m</code>。谁来拦住它？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>kubelet</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>调度器</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>NVIDIA 驱动</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>容器里通过 <code>ld.so.preload</code> 加载的 <code>libvgpu.so</code>（HAMi-core）</span></div>
+      <div class="expl">
+        设备插件只负责<strong>把限额告诉容器</strong>（环境变量）和
+        <strong>把执行者塞进容器</strong>（<code>libvgpu.so</code> + <code>ld.so.preload</code>）。
+        真正的拦截发生在<strong>容器内的用户态</strong>：
+        <code>libvgpu.so</code> 抢先导出了 <code>cuMemAlloc</code> 等符号，
+        应用调它时先经过额度检查，超了就返回 <code>CUDA_ERROR_OUT_OF_MEMORY</code>。
+        <br>A、B、C 都不参与运行时限制 —— 下一章详细拆这个机制。
+      </div>
+    </div>
+
+    <h2>9. 小结</h2>
+
+    <ul>
+      <li>设备插件有三个身份：对 kubelet 是标准 DP、<b>对调度器是清单上报器</b>、<b>对容器是环境注入器</b>。</li>
+      <li>「一张卡变十张」是给 kubelet 看的<b>善意谎言</b>，真正的限制在容器里执行。</li>
+      <li>清单上报有<b>内容去重</b>（deviceCache）和<b>限频事件</b>两个优化。</li>
+      <li><code>Allocate()</code> <b>不知道请求属于哪个 Pod</b>，靠 <code>bind-phase=allocating</code> 猜 ——
+          这是全协议最脆弱的一环，靠节点锁保证唯一性。</li>
+      <li><b>消费即擦除</b> <code>to-allocate</code>，防止容器重启时重复分配；<code>allocated</code> 保留做账本。</li>
+      <li>容器序号换算依赖<b>空容器也占位</b>的编码约定。</li>
+      <li>节点锁在 <code>PodAllocationSuccess/Failed</code> 里释放，<b>闭环到第 06 章</b>。</li>
+    </ul>
+
+    <p class="next-hint">环境变量已经注入，<code>libvgpu.so</code> 已经挂载。
+        下一章走进容器内部，看 <strong>HAMi-core</strong> 这个 C 库
+        怎么用 <code>dlsym</code> 劫持 CUDA、怎么做显存 OOM 判断、
+        怎么用令牌桶限制算力。</p>
+
+    <div class="chapter-nav" id="chapterNav"></div>
+  </main>
+</div>
+
+<script src="../assets/js/site.js"></script>
+<script>
+/* ========== 实验室 1：getPendingPod 模拟器 ========== */
+(function () {
+  let pods = [
+    { name: 'my-train',  phase: 'Pending', bindTime: true,  bindPhase: 'allocating', node: 'node-1' },
+    { name: 'other-app', phase: 'Running', bindTime: true,  bindPhase: 'success',    node: 'node-1' },
+    { name: 'no-hami',   phase: 'Pending', bindTime: false, bindPhase: '',           node: 'node-1' },
+    { name: 'elsewhere', phase: 'Pending', bindTime: true,  bindPhase: 'allocating', node: 'node-9' },
+  ];
+  const ctl = document.getElementById('pendCtl');
+  const out = document.getElementById('pendOut');
+
+  function render() {
+    ctl.innerHTML = pods.map((p, i) => `
+      <div class="field-row" style="margin-bottom:7px">
+        <div style="flex:2 1 120px"><label class="f">Pod</label><input type="text" data-i="${i}" data-k="name" value="${p.name}"></div>
+        <div><label class="f">Phase</label>
+          <select data-i="${i}" data-k="phase">
+            ${['Pending','Running','Succeeded'].map(x => `<option ${x === p.phase ? 'selected' : ''}>${x}</option>`).join('')}
+          </select></div>
+        <div><label class="f">bind-time</label>
+          <select data-i="${i}" data-k="bindTime">
+            <option value="true" ${p.bindTime ? 'selected' : ''}>有</option>
+            <option value="false" ${!p.bindTime ? 'selected' : ''}>无</option>
+          </select></div>
+        <div><label class="f">bind-phase</label>
+          <select data-i="${i}" data-k="bindPhase">
+            ${['','allocating','success','failed'].map(x => `<option value="${x}" ${x === p.bindPhase ? 'selected' : ''}>${x || '（无）'}</option>`).join('')}
+          </select></div>
+        <div><label class="f">vgpu-node</label><input type="text" data-i="${i}" data-k="node" value="${p.node}"></div>
+      </div>`).join('');
+    ctl.querySelectorAll('input,select').forEach(el => el.addEventListener('input', () => {
+      const p = pods[+el.dataset.i], k = el.dataset.k;
+      p[k] = k === 'bindTime' ? el.value === 'true' : el.value;
+      show();
+    }));
+  }
+
+  function show() {
+    let html = '<span class="key">GetPendingPod(ctx, "node-1")  —— pkg/util/util.go:76</span>\n\n';
+    const hits = [];
+    pods.forEach(p => {
+      const checks = [
+        [p.phase === 'Pending',        `① Phase == Pending`,                    `Phase 是 ${p.phase}`],
+        [p.bindTime,                   `② 有 hami.io/bind-time 注解`,            `没有 bind-time 注解`],
+        [p.bindPhase === 'allocating' || p.bindPhase === 'success',
+                                       `③ bind-phase ∈ {allocating, success}`,   `bind-phase = "${p.bindPhase || '无'}"`],
+        [p.node === 'node-1',          `④ vgpu-node == "node-1"`,               `vgpu-node = "${p.node}"`],
+      ];
+      const failIdx = checks.findIndex(c => !c[0]);
+      if (failIdx === -1) {
+        hits.push(p.name);
+        html += `<span class="ok">✓ ${p.name}</span>  四项全部通过 —— <b>候选</b>\n`;
+      } else {
+        html += `<span class="dim">✗ ${p.name}  在 ${checks[failIdx][1].slice(0,2)} 被过滤：${checks[failIdx][2]}</span>\n`;
+      }
+    });
+    html += '\n';
+    if (hits.length === 0) {
+      html += `<span class="bad">✗ 没有候选 → return error "no binding pod found on node node-1"</span>\n`;
+      html += `<span class="dim">   Allocate 直接返回错误，kubelet 会把 Pod 标为 UnexpectedAdmissionError。\n`;
+      html += `   而且这条路径<b>不会释放节点锁</b>（那行代码被注释掉了），\n`;
+      html += `      只能等 5 分钟锁超时。</span>`;
+    } else if (hits.length === 1) {
+      html += `<span class="ok">→ 选中 ${hits[0]}，读它的 vgpu-devices-to-allocate 注解</span>`;
+    } else {
+      html += `<span class="bad">有 ${hits.length} 个候选：${hits.join(', ')}</span>\n`;
+      html += `<span class="bad">   代码取的是 podlist.Items 里的<b>第一个</b>，而 List 顺序不保证！</span>\n`;
+      html += `<span class="bad">   → 可能把 ${hits[1]} 的显存配置发给 ${hits[0]} 的容器。</span>\n\n`;
+      html += `<span class="dim">这就是<b>节点锁存在的根本原因</b>（第 06 章）：\n`;
+      html += `保证同一时刻同一节点上只有一个 Pod 处于 allocating。\n`;
+      html += `注意条件 ③ 也接受 success，这是为多容器 Pod 开的口子，\n`;
+      html += `但也扩大了误配窗口 —— 这是一个真实的设计权衡。</span>`;
+    }
+    out.innerHTML = html;
+  }
+  render(); show();
+})();
+
+/* ========== 实验室 2：环境变量注入器 ========== */
+(function () {
+  const out = document.getElementById('envOut');
+  function run() {
+    const anno = document.getElementById('envAnno').value.trim();
+    const scale = parseFloat(document.getElementById('envScale').value) || 1;
+    const disable = document.getElementById('envDisable').value === 'true';
+    const log = document.getElementById('envLog').value;
+
+    const devs = anno.split(':').filter(x => x).map(x => {
+      const f = x.split(',');
+      return { uuid: f[0], type: f[1], mem: +f[2], cores: +f[3] };
+    });
+    if (devs.length === 0 || devs.some(d => isNaN(d.mem))) {
+      out.innerHTML = '<span class="bad">✗ 注解格式不合法，DecodeContainerDevices 会返回 error → PodAllocationFailed</span>';
+      return;
+    }
+    let html = `<span class="key">AllocateResponse.Envs</span>\n`;
+    devs.forEach((d, i) => {
+      html += `  CUDA_DEVICE_MEMORY_LIMIT_${i} = <span class="ok">${d.mem}m</span>   <span class="dim">← ${d.uuid}</span>\n`;
+    });
+    html += `  CUDA_DEVICE_SM_LIMIT         = <span class="ok">${devs[0].cores}</span>   <span class="dim">← 只取第 0 张卡的算力值（!）</span>\n`;
+    html += `  CUDA_DEVICE_MEMORY_SHARED_CACHE = <span class="dim">/usr/local/vgpu/&lt;uuid&gt;.cache</span>\n`;
+    if (scale > 1) html += `  CUDA_OVERSUBSCRIBE           = <span class="warn">true</span>   <span class="dim">← DeviceMemoryScaling=${scale} > 1</span>\n`;
+    if (log) html += `  LIBCUDA_LOG_LEVEL            = ${log}\n`;
+    if (disable) html += `  GPU_CORE_UTILIZATION_POLICY  = <span class="warn">disable</span>   <span class="dim">← 算力限制被关闭</span>\n`;
+    html += `  NVIDIA_VISIBLE_DEVICES       = <span class="dim">${devs.map(d => d.uuid).join(',')}</span>\n`;
+
+    html += `\n<span class="key">AllocateResponse.Mounts</span>\n`;
+    html += `  /usr/local/vgpu/libvgpu.so      <span class="dim">← HAMi-core 劫持库</span>\n`;
+    html += `  /etc/ld.so.preload              <span class="dim">← 内容："/usr/local/vgpu/libvgpu.so"</span>\n`;
+    html += `  /usr/local/vgpu/containers/&lt;podUID&gt;_&lt;ctrName&gt;/   <span class="dim">← 跨进程用量共享目录</span>\n`;
+
+    html += `\n<span class="key">容器启动后</span>\n`;
+    html += `  <span class="dim">动态链接器读 /etc/ld.so.preload → 优先加载 libvgpu.so\n`;
+    html += `  → 应用调 cuMemAlloc() 时命中劫持函数\n`;
+    html += `  → 累计分配量超过 ${devs[0].mem}MB 就返回 CUDA_ERROR_OUT_OF_MEMORY(2)</span>\n`;
+
+    if (devs.length > 1 && devs.some(d => d.cores !== devs[0].cores)) {
+      html += `\n<span class="bad">注意：这个容器分到了 ${devs.length} 张卡，但算力值不一致</span>\n`;
+      html += `<span class="dim">   CUDA_DEVICE_SM_LIMIT 是<b>单个值</b>，只取了 devreq[0].Usedcores。\n`;
+      html += `   显存是每卡一个变量（_0/_1/…），算力却是全局一个 —— 这是一个真实的不对称设计。</span>`;
+    }
+    out.innerHTML = html;
+  }
+  ['envAnno','envScale','envDisable','envLog'].forEach(id =>
+    document.getElementById(id).addEventListener('input', run));
+  run();
+})();
+</script>
+</body>
+</html>

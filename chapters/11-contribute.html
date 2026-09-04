@@ -1,0 +1,684 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · 测试、CI 与第一个 PR — HAMi 源码导读</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2316181d'/%3E%3Ctext x='16' y='23' font-size='17' font-family='monospace' font-weight='bold' fill='%23fff' text-anchor='middle'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main class="main">
+
+    <div class="page-kicker">第 11 章 · 第四阶段 成为贡献者</div>
+    <h1 class="page-title">测试、CI 与提交你的第一个 PR</h1>
+    <p class="page-lede">
+      前面十章你已经比大多数使用者更懂这个项目了。
+      这一章把知识变成贡献：本地跑通全部 CI、挑一个能做的活、
+      写出会被合入的 PR。
+    </p>
+
+    <div class="goals">
+      <h3>学完这章你应该能</h3>
+      <ul>
+        <li>在本地一次性跑通 CI 的全部检查项，不用等 GitHub Actions</li>
+        <li>写出符合项目规范的测试（表驱动 + 边界用例）</li>
+        <li>从本教程沿途标记的问题清单里，挑出一个适合自己的切入点</li>
+        <li>知道 HAMi 的六条「贡献门槛」，尤其是 AI 辅助的披露要求</li>
+        <li>提交一个格式正确、评审友好的 PR</li>
+      </ul>
+    </div>
+
+    <div class="note trap">
+      <div class="t">先读这一条：HAMi 的 AI 辅助披露要求非常严格</div>
+      <p>
+        <code>CONTRIBUTING.md</code> 里明确规定：
+        任何形式的 AI 辅助都必须在 PR 描述里披露，
+        并说明使用程度（只写文档 vs 生成代码）。
+      </p>
+      <p>还有六条硬性门槛（<code>Contribution Gates</code>），其中最关键的三条：</p>
+      <ul style="margin-bottom:0">
+        <li><b>作者理解门槛</b>：维护者问「这段怎么工作的」，答不上来 → <strong>PR 直接关闭</strong>。</li>
+        <li>大型 AI 生成 PR 不接受：小修复之外的改动必须先开 issue，拆成可评审的多个 commit。
+            commit message 必须自己写。</li>
+        <li>不允许把 AI 列为 co-author：不要 <code>Co-authored-by</code> / <code>assisted-by</code> 等 trailer，
+            披露只写在 PR 描述里。</li>
+      </ul>
+      <p style="margin-bottom:0">
+        这套教程能帮你达到「理解门槛」，但代码必须你自己写、自己懂。
+      </p>
+    </div>
+
+    <h2>1. 本地跑通 CI：五分钟自查</h2>
+
+    <p>
+      GitHub Actions 的 <code>lint</code> job 一共跑 4 项检查
+      （<span data-srcref=".github/workflows/ci.yaml"></span>）。
+      全部可以在本地跑，别浪费时间等 CI 告诉你少了个 license 头。
+    </p>
+
+    <div class="codeblock" data-lang="bash" data-title="提交前的完整自查清单">
+<pre><code># ① License 头检查（最容易忘，新建 .go 文件必踩）
+hack/verify-license.sh
+
+# ② go.mod 整洁
+make tidy && git diff --exit-code go.mod go.sum
+
+# ③ golangci-lint（版本必须是 v2.13.1，跟 CI 一致）
+make lint
+#   或者直接： hack/verify-staticcheck.sh
+
+# ④ K8s import 别名规范
+hack/verify-import-aliases.sh
+
+# ⑤ RBAC 一致性（改了权限相关代码才需要）
+hack/verify-rbac.sh
+
+# ⑥ 单元测试 + 竞态检测
+go test ./pkg/... ./cmd/... -short -race -count=1
+
+# ⑦ 覆盖率报告（输出在 _output/coverage/）
+make test
+
+# —— 一把梭：上面 ①③④⑤ 一次跑完 ——
+hack/verify-all.sh</code></pre>
+    </div>
+
+    <div class="lab">
+      <header>提交前自查清单<span class="badge">互动</span></header>
+      <div class="body">
+        <p style="font-size:13.5px;color:var(--fg-soft);margin-bottom:12px">
+          勾一遍，全绿了再推。（这个清单不计入章节进度，随便勾。）
+        </p>
+        <div id="ciList"></div>
+        <div class="out" id="ciOut"></div>
+      </div>
+    </div>
+
+    <h3>1.1 最容易踩的三个坑</h3>
+
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:150px">坑</th><th>症状</th><th>怎么修</th></tr>
+      <tr>
+        <td><b>缺 License 头</b></td>
+        <td><code>verify-license.sh</code> 失败</td>
+        <td>每个新 <code>.go</code> 文件都要 Apache 2.0 头。抄同目录任意一个文件的前 15 行</td>
+      </tr>
+      <tr>
+        <td><b>import 别名不规范</b></td>
+        <td><code>verify-import-aliases.sh</code> 失败</td>
+        <td>K8s 包必须用规定别名：<code>corev1</code>、<code>metav1</code>、<code>apierrors</code>…
+            完整表在 <span data-srcref="hack/.import-aliases"></span></td>
+      </tr>
+      <tr>
+        <td><b>import 分组顺序</b></td>
+        <td>lint 报 <code>goimports</code></td>
+        <td>三组，中间空行：标准库 → 第三方 → <code>github.com/Project-HAMi/HAMi/...</code></td>
+      </tr>
+    </table>
+    </div>
+
+    <div class="codeblock" data-lang="go" data-title="正确的 import 写法">
+<pre><code>import (
+	"context"
+	"fmt"
+	"strings"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2"
+
+	"github.com/Project-HAMi/HAMi/pkg/device"
+	"github.com/Project-HAMi/HAMi/pkg/util"
+)</code></pre>
+    </div>
+
+    <div class="note tip">
+      <div class="t">一键修 import</div>
+      <div class="codeblock" data-lang="bash">
+<pre><code>go install golang.org/x/tools/cmd/goimports@latest
+goimports -w -local github.com/Project-HAMi/HAMi ./pkg ./cmd</code></pre>
+      </div>
+    </div>
+
+    <h2>2. 怎么写 HAMi 风格的测试</h2>
+
+    <p>
+      HAMi 的测试<strong>清一色是表驱动</strong>。照着写，评审会顺畅很多。
+    </p>
+
+    <div class="codeblock" data-lang="go" data-title="标准模板（参考 pkg/device/nvidia/device_test.go:826）">
+<pre><code>func TestSomething(t *testing.T) {
+	tests := []struct {
+		name    string                  // 用例名，出问题时靠它定位
+		args    struct{ /* 输入 */ }
+		want    /* 期望输出 */
+		wantErr bool
+	}{
+		{
+			name: "正常路径：显存刚好够",
+			// ...
+		},
+		{
+			name: "边界：显存差 1MB",       // 边界用例是评审最看重的
+			// ...
+		},
+		{
+			name: "异常：负数输入",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {      // 子测试，可以单独跑
+			got, err := DoSomething(tt.args)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("DoSomething() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			assert.Equal(t, tt.want, got)         // 项目用 testify
+		})
+	}
+}</code></pre>
+    </div>
+
+    <div class="note warn">
+      <div class="t">测试需要 <code>DevicesMap</code> 时，记得先初始化</div>
+      <p style="margin-bottom:0">
+        第 02 章讲过：<code>device.GetDevices()</code> 默认是空的。
+        看 <span data-srcref="pkg/scheduler/score_test.go:42"></span> 的 <code>TestMain</code>
+        是怎么做的，照抄。
+        <br>否则你的测试会「什么都没发生就通过了」—— 这种<strong>假绿</strong>比失败更糟。
+      </p>
+    </div>
+
+    <h3>2.1 只跑你关心的测试</h3>
+
+    <div class="codeblock" data-lang="bash">
+<pre><code># 单个测试函数
+go test ./pkg/scheduler/ -run Test_calcScore -v -count=1
+
+# 单个子测试（表驱动里的某一个用例）
+go test ./pkg/scheduler/ -run 'Test_calcScore/显存刚好够' -v -count=1
+
+# 正则匹配多个
+go test ./pkg/device/... -run 'TestDecode|TestEncode' -v -count=1
+
+# 加详细日志（klog）
+go test ./pkg/device/nvidia/ -run TestDevices_Fit -count=1 -args -v=5
+
+# 看某个包的覆盖率
+go test ./pkg/scheduler/ -coverprofile=/tmp/c.out -count=1
+go tool cover -html=/tmp/c.out</code></pre>
+    </div>
+
+    <h2>3. 找活干：本教程沿途标记的清单</h2>
+
+    <p>
+      前面十章里，我标了不少 <code></code> 的地方。汇总在这里，
+      <strong>按难度和风险排了序</strong>。
+    </p>
+
+    <div class="lab">
+      <header>可下手的贡献点<span class="badge">互动</span></header>
+      <div class="body">
+        <div class="field-row">
+          <div style="flex:1 1 160px"><label class="f">按难度筛选</label>
+            <select id="taskLevel">
+              <option value="all">全部</option>
+              <option value="1">入门（几十行，低风险）</option>
+              <option value="2">进阶（需要理解上下文）</option>
+              <option value="3">硬骨头（需要设计讨论）</option>
+            </select>
+          </div>
+        </div>
+        <div id="taskList"></div>
+      </div>
+    </div>
+
+    <h3>3.1 自己找活的几个办法</h3>
+
+    <div class="codeblock" data-lang="bash">
+<pre><code># ① 全项目的 TODO / FIXME（每一条都是作者留下的线索）
+grep -rn "TODO\|FIXME\|XXX\|HACK" --include=*.go pkg/ cmd/ | grep -v _test
+
+# ② 被注释掉的代码（往往是「有问题但没想好怎么修」）
+grep -rn "^\s*//\s*[a-z].*(" --include=*.go pkg/ | grep -v "^\s*//\s*[A-Z]" | head -20
+
+# ③ 覆盖率低的地方
+make test
+go tool cover -func=_output/coverage/coverage.out | sort -k3 -n | head -30
+
+# ④ 最近改动频繁的文件（说明还在演进，容易有遗留问题）
+git log --since="3 months ago" --name-only --pretty=format: -- 'pkg/**/*.go' \
+  | grep -v '_test' | sort | uniq -c | sort -rn | head -15
+
+# ⑤ 只有实现没有测试的函数
+for f in $(find pkg -name '*.go' ! -name '*_test.go'); do
+  t="${f%.go}_test.go"
+  [ -f "$t" ] || echo "无测试文件: $f"
+done</code></pre>
+    </div>
+
+    <div class="note tip">
+      <div class="t">GitHub 上的官方入口</div>
+      <ul style="margin-bottom:0">
+        <li><a href="https://github.com/Project-HAMi/HAMi/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22" target="_blank" rel="noopener">good first issue</a>
+            —— 不需要深入理解系统的活</li>
+        <li><a href="https://github.com/Project-HAMi/HAMi/issues?q=is%3Aopen+is%3Aissue+label%3A%22help+wanted%22" target="_blank" rel="noopener">help wanted</a>
+            —— 维护者明确希望有人接手的</li>
+      </ul>
+      <p style="margin-bottom:0">
+        <strong>认领方式</strong>：在 issue 下回复一句，等维护者 assign 给你。
+        <br>年度 roadmap 那种「一个 issue 里一堆勾选项」的，
+        即使 issue 没有 assignee，某个具体项也可能已经被人在评论里认领了 ——
+        动手前先评论认领并等维护者确认。
+      </p>
+    </div>
+
+    <h2>4. 提交 PR 的完整流程</h2>
+
+    <ol class="steps">
+      <li>
+        <span class="st">Fork + 建分支</span>
+        <div class="codeblock" data-lang="bash"><pre><code>git remote add upstream https://github.com/Project-HAMi/HAMi.git
+git fetch upstream
+git checkout -b fix/node-deleted-interface upstream/master</code></pre></div>
+        <p style="font-size:13.5px;color:var(--fg-soft)">
+          分支名用 <code>fix/</code>、<code>feat/</code>、<code>docs/</code>、<code>test/</code> 前缀，跟 commit 前缀对应。
+        </p>
+      </li>
+      <li>
+        <span class="st">改代码 + 补测试</span>
+        <p style="font-size:13.5px;color:var(--fg-soft)">
+          <strong>改行为必须带测试。</strong>没测试的功能 PR 基本不会被合。
+          修 bug 的话，最好先写一个能复现 bug 的失败测试，再修。
+        </p>
+      </li>
+      <li>
+        <span class="st">本地跑全部检查</span>
+        <div class="codeblock" data-lang="bash"><pre><code>hack/verify-all.sh
+go test ./pkg/... ./cmd/... -short -race -count=1</code></pre></div>
+      </li>
+      <li>
+        <span class="st">写 commit message（自己写，别用 AI 生成）</span>
+        <div class="codeblock" data-lang="bash" data-title="项目实际使用的格式（看 git log 就知道）">
+<pre><code>fix(scheduler): validate NUMA refit quota with container positions
+feat(nvidia): score MIG placements and add backtracking fallback
+test(scheduler): add Go benchmarks for the Filter scoring path
+docs(develop): correct handshake timeout from 5m to 60s
+build(deps): bump github/issue-labeler from 3.4 to 3.5</code></pre></div>
+        <p style="font-size:13.5px;color:var(--fg-soft)">
+          格式：<code>&lt;类型&gt;(&lt;范围&gt;): &lt;做了什么&gt;</code>，动词开头，小写，不加句号。
+          <br>不要加任何 AI 相关的 trailer（<code>Co-authored-by: Claude</code> 之类），
+          这是明文禁止的。
+        </p>
+      </li>
+      <li>
+        <span class="st">推送并开 PR</span>
+        <div class="codeblock" data-lang="bash"><pre><code>git push origin fix/node-deleted-interface
+gh pr create --repo Project-HAMi/HAMi --fill   # 或者在网页上开</code></pre></div>
+      </li>
+      <li>
+        <span class="st">写 PR 描述（这是最容易被忽视、也最影响评审速度的一步）</span>
+        <div class="codeblock" data-lang="text" data-title="PR 描述模板">
+<pre><code>## What this PR does / why we need it
+
+onDelNode 里用类型断言硬编码了 *nvidia.NvidiaGPUDevices 来调用 NodeDeleted。
+改成一个可选接口，其他后端将来需要清理每节点状态时不用再改这里。
+行为完全不变。
+
+## Which issue(s) this PR fixes
+
+Fixes #xxxx        （没有对应 issue 就写 NONE）
+
+## Special notes for your reviewer
+
+- 纯重构，无行为变更
+- 新增 TestOnDelNodeCallsNodeDeleted 验证接口断言仍然命中 NVIDIA 后端
+- 已在本地跑过 hack/verify-all.sh 和 go test ./pkg/... -race
+
+## Testing
+
+- [x] 单元测试：go test ./pkg/scheduler/ -run TestOnDelNode -race -count=1
+- [ ] 真实 GPU 硬件验证：不适用（仅调度器扩展器范围）
+
+## AI assistance disclosure
+
+I used Claude Code to explore the codebase and locate this pattern.
+The change and its test were written by me; I reviewed and understand
+every line.</code></pre></div>
+      </li>
+      <li>
+        <span class="st">回应评审</span>
+        <p style="font-size:13.5px;color:var(--fg-soft)">
+          回复必须自己写，而且要正面回应对方提的具体那一点。
+          套话式的、AI 生成的回复会导致 PR 被关闭。
+          <br>不同意评审意见也没关系，把理由说清楚 —— 但先确认自己真的理解了对方的顾虑。
+        </p>
+      </li>
+    </ol>
+
+    <div class="note warn">
+      <div class="t">关于「硬件验证」这条门槛</div>
+      <p style="margin-bottom:0">
+        <code>CONTRIBUTING.md</code> 规定：影响设备分配或容器内隔离的改动，
+        必须在真实 GPU 上验证过，并在 PR 里写明测了什么、什么型号、什么驱动版本。
+        <br>但「仅限于调度器扩展器范围」的改动可以只用单元测试或 mock。
+        <br><em>如果你没有 GPU，这就框定了你能做的范围：
+        <code>pkg/scheduler/</code>、<code>pkg/device/*/</code> 的纯逻辑、文档、测试 ——
+        而这恰好是本教程覆盖最深的部分。</em>
+      </p>
+    </div>
+
+    <h2>5. 一个完整的示范：从发现到 PR</h2>
+
+    <p>拿第 07 章那个类型断言的例子，走一遍完整流程：</p>
+
+    <details class="fold" open>
+      <summary>① 发现问题</summary>
+      <div class="fold-body">
+        <div class="codeblock" data-file="pkg/scheduler/scheduler.go" data-start="306" data-lang="go" data-hl="4-6">
+<pre><code>	// Clear per-device health bookkeeping for the deleted node.
+	// Devices that track per-node state (e.g. NvidiaGPUDevices) implement
+	// NodeDeleted to prune their internal maps; others are a no-op.
+	for _, devInstance := range device.GetDevices() {
+		if nd, ok := devInstance.(*nvidia.NvidiaGPUDevices); ok {
+			nd.NodeDeleted(nodeName)
+		}
+	}</code></pre>
+        </div>
+        <p>问题：注释说「其他后端是 no-op」，但代码<strong>硬编码了具体类型</strong>。
+           别的后端就算实现了 <code>NodeDeleted</code> 也不会被调用。</p>
+      </div>
+    </details>
+
+    <details class="fold">
+      <summary>② 确认是不是真问题（别急着改）</summary>
+      <div class="fold-body">
+        <div class="codeblock" data-lang="bash">
+<pre><code># 有没有别的后端也实现了 NodeDeleted？
+grep -rn "func.*NodeDeleted" pkg/device/ --include=*.go
+
+# 是不是有意为之？看这行是什么时候、为什么加的
+git log -L 308,315:pkg/scheduler/scheduler.go | head -60
+
+# GitHub 上有没有相关讨论
+# 搜 issue: "NodeDeleted" / "type assertion"</code></pre>
+        </div>
+        <p style="margin-bottom:0">
+          <strong>这一步不能省。</strong>很多「看起来不对」的代码其实有原因，
+          直接提 PR 会显得没做功课。
+        </p>
+      </div>
+    </details>
+
+    <details class="fold">
+      <summary>③ 改动</summary>
+      <div class="fold-body">
+        <div class="codeblock" data-lang="go" data-title="改成可选接口（跟 policyNeutralScorer 一致的模式）">
+<pre><code>// nodeDeletedNotifier is implemented by device backends that keep per-node
+// bookkeeping and need to prune it when a node leaves the cluster. Backends
+// that keep no per-node state simply do not implement it.
+type nodeDeletedNotifier interface {
+	NodeDeleted(nodeName string)
+}
+
+// ... 在 onDelNode 里：
+	for _, devInstance := range device.GetDevices() {
+		if nd, ok := devInstance.(nodeDeletedNotifier); ok {
+			nd.NodeDeleted(nodeName)
+		}
+	}</code></pre>
+        </div>
+        <p style="margin-bottom:0">
+          注意：<strong>项目里已经有这个模式了</strong>（第 05 章的 <code>policyNeutralScorer</code>）。
+          跟随代码库已有的惯例，比引入新写法更容易被接受。
+        </p>
+      </div>
+    </details>
+
+    <details class="fold">
+      <summary>④ 补测试</summary>
+      <div class="fold-body">
+        <div class="codeblock" data-lang="go">
+<pre><code>func TestOnDelNodeNotifiesBackends(t *testing.T) {
+	// 验证：NVIDIA 后端（真实类型）仍然会被通知到
+	// 验证：一个假的实现了 nodeDeletedNotifier 的后端也会被通知到
+	// 验证：没实现该接口的后端不会 panic
+}</code></pre>
+        </div>
+        <p style="margin-bottom:0">
+          第三条尤其重要 —— <strong>证明改动没有引入新的崩溃路径</strong>。
+        </p>
+      </div>
+    </details>
+
+    <details class="fold">
+      <summary>⑤ 自查 + 提交</summary>
+      <div class="fold-body">
+        <div class="codeblock" data-lang="bash">
+<pre><code>hack/verify-all.sh
+go test ./pkg/scheduler/ -race -count=1
+
+git add -p
+git commit    # 自己写 message：
+              # refactor(scheduler): notify device backends of node deletion via interface
+git push origin refactor/node-deleted-interface</code></pre>
+        </div>
+      </div>
+    </details>
+
+    <h2>6. 除了写代码，还能怎么贡献</h2>
+
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:150px">方式</th><th>说明</th><th style="width:80px">门槛</th></tr>
+      <tr><td><b>改文档</b></td><td>比如第 01 章发现的：<code>docs/develop/protocol.md</code> 写 5 分钟，代码里是 60 秒</td><td>低</td></tr>
+      <tr><td><b>补测试</b></td><td>给某个后端的 <code>Fit</code> 补边界用例；给覆盖率低的函数补测试</td><td>低</td></tr>
+      <tr><td><b>改进错误信息</b></td><td>让 event / 日志更能指导用户「该怎么改」</td><td>低</td></tr>
+      <tr><td><b>复现并报告 bug</b></td><td>带最小复现步骤的 issue，对维护者价值很高</td><td>低</td></tr>
+      <tr><td><b>翻译 / 本地化</b></td><td>项目有 <code>README_cn.md</code> / <code>README_ja.md</code></td><td>低</td></tr>
+      <tr><td><b>评审别人的 PR</b></td><td>你现在有能力看懂调度逻辑了，指出问题就是贡献</td><td>中</td></tr>
+      <tr><td><b>性能优化</b></td><td>用 <code>score_bench_test.go</code> 量化，拿数据说话</td><td>中</td></tr>
+      <tr><td><b>新增设备后端</b></td><td>第 02 章那个清单；需要对应硬件</td><td>高</td></tr>
+    </table>
+    </div>
+
+    <h2>7. 本章自测</h2>
+
+    <div class="quiz" data-answer="C">
+      <div class="q">你用 AI 帮忙理解代码，但改动是自己写的。PR 里该怎么处理？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>不用提，因为代码是自己写的</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>在 commit 里加 <code>Co-authored-by: Claude</code></span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>在 PR <b>描述</b>里披露，说明使用程度；<b>不要</b>加任何 AI 相关的 commit trailer</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>在代码注释里标注</span></div>
+      <div class="expl">
+        <code>CONTRIBUTING.md</code> 说得很明确：
+        任何形式的 AI 辅助都要披露（包括只用来理解代码），
+        而且<strong>披露只写在 PR 描述里</strong>。
+        <br>Gate 5「Commit trailer hygiene」<strong>明文禁止</strong>把 AI 列为 co-author，
+        或用 <code>assisted-by</code> / <code>co-developed-by</code> 之类的 trailer。
+        <br>唯一的例外是「单个关键词或短语的 tab 补全」不用披露。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="B">
+      <div class="q">你没有 GPU 硬件。下面哪类 PR <strong>可以</strong>只用单元测试就提交？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>改 HAMi-core 的显存 OOM 判断逻辑</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>给 <code>pkg/scheduler/score.go</code> 的打分逻辑修一个边界 bug</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>改设备插件注入的环境变量</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>改 MIG 实例的创建流程</span></div>
+      <div class="expl">
+        Gate 2 规定：<strong>影响设备分配或容器内隔离</strong>的改动必须真机验证，
+        但「scoped to the scheduler extender」的改动可以用 mock 或单元测试。
+        <br>A（容器内隔离）、C（设备分配）、D（MIG 实例创建）都需要真实硬件。
+        <br>这也意味着：没有 GPU 的贡献者，主战场是调度器扩展器、纯逻辑、测试和文档。正好是本教程第 01-07 章覆盖的部分。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="A">
+      <div class="q">CI 的 lint job 会跑哪几项？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>verify-license、make tidy、golangci-lint v2.13.1、verify-import-aliases</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>只有 golangci-lint</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>只有单元测试</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>e2e 测试</span></div>
+      <div class="expl">
+        见 <code>.github/workflows/ci.yaml</code> 的 <code>lint</code> job。
+        golangci-lint 的版本 <strong>v2.13.1</strong> 同时钉在 CI 配置和
+        <code>hack/verify-staticcheck.sh</code> 里 —— <strong>本地一定要用同一个版本</strong>，
+        不同版本的检查项不一样，本地过了 CI 可能挂。
+        <br>单元测试和 e2e 是另外的 job。<code>hack/verify-all.sh</code> 一次跑完 lint 相关的几项。
+      </div>
+    </div>
+
+    <h2>8. 小结</h2>
+
+    <ul>
+      <li>提交前本地跑 <code>hack/verify-all.sh</code> + <code>go test ./pkg/... -short -race -count=1</code>，别等 CI。</li>
+      <li>三个高频坑：<b>License 头</b>、<b>K8s import 别名</b>、<b>import 三段分组</b>。</li>
+      <li>测试写表驱动 + 子测试 + 边界用例；需要 <code>DevicesMap</code> 记得在 <code>TestMain</code> 初始化。</li>
+      <li>HAMi 的六条贡献门槛里，最关键的是<b>作者理解门槛</b>、<b>AI 披露</b>、<b>不加 AI trailer</b>。</li>
+      <li>没有 GPU 也能贡献：调度器扩展器逻辑、测试、文档、错误信息。</li>
+      <li>找活的四个渠道：<b>TODO/FIXME</b>、<b>被注释掉的代码</b>、<b>覆盖率洼地</b>、good first issue。</li>
+      <li>改之前先 <code>git log -L</code> 查历史 —— <b>确认这不是有意为之</b>。</li>
+    </ul>
+
+    <div class="note">
+      <div class="t">恭喜</div>
+      <p style="margin-bottom:0">
+        走到这里，你已经完整地理解了 HAMi 的架构、协议、核心算法和并发模型，
+        并且知道怎么把它变成贡献。
+        <br>下一页是<strong>速查手册</strong>，读码时随手翻。
+      </p>
+    </div>
+
+    <div class="chapter-nav" id="chapterNav"></div>
+  </main>
+</div>
+
+<script src="../assets/js/site.js"></script>
+<script>
+/* ========== 实验室 1：CI 自查清单 ========== */
+(function () {
+  const ITEMS = [
+    ['hack/verify-license.sh', '所有新建 .go 文件都有 Apache 2.0 头'],
+    ['make tidy && git diff --exit-code go.mod go.sum', 'go.mod / go.sum 整洁无变动'],
+    ['make lint', 'golangci-lint v2.13.1 通过'],
+    ['hack/verify-import-aliases.sh', 'K8s import 别名符合 hack/.import-aliases'],
+    ['hack/verify-rbac.sh', 'RBAC 一致（改了权限才需要）'],
+    ['go test ./pkg/... ./cmd/... -short -race -count=1', '单元测试 + 竞态检测全绿'],
+    ['—', '改动带了对应的测试用例'],
+    ['—', 'commit message 自己写的，格式 type(scope): desc'],
+    ['—', 'PR 描述里披露了 AI 辅助（如果用了）'],
+    ['—', 'commit 里没有任何 AI 相关的 trailer'],
+    ['—', '涉及设备分配/容器隔离的改动，已在真实 GPU 上验证'],
+  ];
+  const host = document.getElementById('ciList');
+  const out = document.getElementById('ciOut');
+  host.innerHTML = ITEMS.map((it, i) => `
+    <label style="display:flex;gap:10px;align-items:flex-start;padding:5px 0;cursor:pointer;font-size:13.5px">
+      <input type="checkbox" data-i="${i}" style="margin-top:4px;accent-color:var(--accent);width:15px;height:15px;flex:none">
+      <span>
+        <span>${it[1]}</span>
+        ${it[0] !== '—' ? `<br><code style="font-size:11.5px">${it[0]}</code>` : ''}
+      </span>
+    </label>`).join('');
+  function upd() {
+    const boxes = host.querySelectorAll('input');
+    const done = [...boxes].filter(b => b.checked).length;
+    const pct = Math.round(done / ITEMS.length * 100);
+    out.innerHTML = `<div class="progress-bar" style="margin-bottom:8px"><i style="width:${pct}%"></i></div>` +
+      (done === ITEMS.length
+        ? '<span class="ok">✓ 全部就绪，可以推送开 PR 了。</span>'
+        : `<span class="dim">${done} / ${ITEMS.length} 完成。还差 ${ITEMS.length - done} 项。</span>`);
+  }
+  host.querySelectorAll('input').forEach(b => b.addEventListener('change', upd));
+  upd();
+})();
+
+/* ========== 实验室 2：贡献点清单 ========== */
+(function () {
+  const TASKS = [
+    { lv: 1, t: '修正 protocol.md 里的握手超时', ch: '第 01 章',
+      d: '文档写「5 分钟」，代码 CheckHealth 里是 60 秒（time.Second * 60）。',
+      where: 'docs/develop/protocol.md · pkg/device/devices.go:604',
+      how: '改文档，顺便确认一下是不是文档对、代码错了 —— 如果是后者，那就是个 bug PR。' },
+    { lv: 1, t: '补某个设备后端 Fit 的边界测试', ch: '第 02、05 章',
+      d: '12 个后端里，有些的 Fit 边界用例不全（显存差 1MB、算力刚好 100、份数用完等）。',
+      where: 'pkg/device/*/device_test.go',
+      how: '对照 nvidia 的 TestDevices_Fit（826 行起）补齐。零风险，纯增量。' },
+    { lv: 1, t: '改进 Fit 失败时的错误信息', ch: '第 04、05 章',
+      d: '有些原因常量只说「不够」，没说「差多少」。用户拿到 event 不知道该改成多少。',
+      where: 'pkg/device/common/common.go · 各后端 Fit',
+      how: '在 GenReason 里带上实际值和需求值。注意格式必须能被 ParseReason 解析。' },
+    { lv: 1, t: '给 DeviceInfo.Type 字段加逗号转义', ch: '第 01 章',
+      d: '型号名里有逗号会导致 DecodeNodeDevices 报 unexpected field count。目前靠约定用连字符规避。',
+      where: 'pkg/device/devices.go:391 EncodeNodeDevices',
+      how: '改编码格式是破坏性变更，需要考虑滚动升级兼容 —— 先开 issue 讨论。' },
+
+    { lv: 2, t: 'onDelNode 的类型断言改成可选接口', ch: '第 07 章',
+      d: '硬编码了 *nvidia.NvidiaGPUDevices，其他后端实现了 NodeDeleted 也不会被调用。',
+      where: 'pkg/scheduler/scheduler.go:308',
+      how: '照抄 policyNeutralScorer 的模式（node_policy.go:64）。纯重构，行为不变，好评审。' },
+    { lv: 2, t: '让节点打分也支持自定义权重', ch: '第 05 章',
+      d: 'ComputeScore 支持 hami.io/device-scoring-weights，但 ComputeDefaultScore 是硬编码等权重。',
+      where: 'pkg/scheduler/policy/node_policy.go:110',
+      how: '先开 issue 问这是不是有意为之 —— 可能有兼容性考虑。' },
+    { lv: 2, t: '审计 Allocate 的错误路径是否都放锁', ch: '第 08 章',
+      d: 'getPendingPod 失败那条路径的 ReleaseNodeLock 被注释掉了，只能等 5 分钟超时。',
+      where: 'pkg/device-plugin/.../plugin/server.go:862',
+      how: '逻辑上确实不知道是哪个 Pod。可以考虑「按节点名释放」的兜底路径。先搜 issue。' },
+    { lv: 2, t: '给 pkg/monitor 的共享内存结构加版本校验', ch: '第 09 章',
+      d: 'Go 侧和 C 侧结构体必须逐字节对齐，不对齐时读出垃圾数据且不报错。',
+      where: 'pkg/monitor/nvidia/v*/spec.go · libvgpu/src/multiprocess/common_header.h',
+      how: '在共享内存头里加 magic + version 字段，读的时候校验。需要同时改 C 和 Go。' },
+    { lv: 2, t: '性能：减少 getNodesUsage 的全量重建', ch: '第 04 章',
+      d: '每次 Filter 都把所有节点、所有 Pod 重算一遍。节点多时是热点。',
+      where: 'pkg/scheduler/scheduler.go:773',
+      how: '先用 score_bench_test.go 量化现状，拿数据开 issue 讨论方案。' },
+
+    { lv: 3, t: '让不健康的 GPU 能恢复', ch: '第 08 章',
+      d: 'ListAndWatch 里明确标了 FIXME：「there is no way to recover from the Unhealthy state」。临时性 XID 错误会让整张卡永久浪费。',
+      where: 'pkg/device-plugin/.../plugin/server.go:633 · rm/health.go',
+      how: '需要设计恢复检测逻辑 + 真机验证。先开 issue 讨论方案。' },
+    { lv: 3, t: '修显存百分比在混插节点上的语义', ch: '第 05 章',
+      d: 'memreq = dev.Totalmem * pct / 100 按每张卡各自算，V100 32G 和 A100 80G 上「50%」含义完全不同。代码里有 //This incurs an issue 注释。',
+      where: 'pkg/device/nvidia/device.go:919',
+      how: '涉及语义变更，需要设计讨论 + 兼容方案。' },
+    { lv: 3, t: '支持 CUDA Graph 里的显存分配', ch: '第 09 章',
+      d: 'find_symbols_in_table 显式跳过 cuGraph*，图内分配绕过限制。',
+      where: 'libvgpu/src/cuda/hook.c:320',
+      how: 'C 代码 + 需要真实 GPU 验证 + 对 CUDA Graph 内部机制要熟。难度很高。' },
+    { lv: 3, t: '新增一个设备后端', ch: '第 02 章',
+      d: '实现 Devices 接口 15 个方法 + 注册 + 配置 + Helm chart + 测试 + 示例。',
+      where: 'pkg/device/<vendor>/',
+      how: '需要对应硬件。抄 pkg/device/kunlun/（245 行）起步最快。先开 issue。' },
+  ];
+  const ICON = { 1: '', 2: '', 3: '' };
+  const LVN = { 1: '入门', 2: '进阶', 3: '硬骨头' };
+  const host = document.getElementById('taskList');
+  const sel = document.getElementById('taskLevel');
+  function render() {
+    const f = sel.value;
+    const list = TASKS.filter(t => f === 'all' || String(t.lv) === f);
+    host.innerHTML = list.map(t => `
+      <details class="fold">
+        <summary>${ICON[t.lv]} ${t.t} <span style="font-weight:400;color:var(--fg-mute);font-size:12px">· ${LVN[t.lv]} · ${t.ch}</span></summary>
+        <div class="fold-body">
+          <p style="font-size:13.5px">${t.d}</p>
+          <p style="font-size:13px;color:var(--fg-soft);margin-bottom:6px"><b>位置：</b><code>${t.where}</code></p>
+          <p style="font-size:13px;color:var(--fg-soft);margin-bottom:0"><b>怎么下手：</b>${t.how}</p>
+        </div>
+      </details>`).join('') ||
+      '<p style="color:var(--fg-mute);font-size:13.5px">没有匹配的条目。</p>';
+  }
+  sel.addEventListener('change', render);
+  render();
+})();
+</script>
+</body>
+</html>

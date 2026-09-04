@@ -1,0 +1,770 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Webhook 准入 — HAMi 源码导读</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2316181d'/%3E%3Ctext x='16' y='23' font-size='17' font-family='monospace' font-weight='bold' fill='%23fff' text-anchor='middle'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main class="main">
+
+    <div class="page-kicker">第 03 章 · 第二阶段 一个 Pod 的旅程</div>
+    <h1 class="page-title">Webhook：Pod 进门的第一道关</h1>
+    <p class="page-lede">
+      Pod 刚被 <code>kubectl apply</code> 提交，还没写进 etcd，就被 HAMi 拦下来了。
+      这一关做三件事：改调度器名字、补默认值、把非法请求挡在门外。
+    </p>
+
+    <div class="goals">
+      <h3>学完这章你应该能</h3>
+      <ul>
+        <li>说清楚为什么必须有 webhook —— 不加它 HAMi 根本不会被调用</li>
+        <li>按顺序背出 <code>Handle()</code> 的 8 个处理步骤</li>
+        <li>列出 4 种会被 <code>Denied</code> 的情况，并解释每种的理由</li>
+        <li>解释「只写 <code>gpumem</code> 不写 <code>gpu</code>」时 HAMi 帮你补了什么</li>
+        <li>跑通 <code>Test_MutateAdmission</code> 并读懂它的用例</li>
+      </ul>
+    </div>
+
+    <h2>1. 为什么必须有这一关</h2>
+
+    <p>
+      Kubernetes 的调度器扩展器（Extender）机制有个前提：
+      kube-scheduler 必须被配置成会去调用你的 HTTP 接口。
+      这个配置是按 schedulerName 生效的。
+    </p>
+
+    <div class="note analogy">
+      <div class="t">改门牌号</div>
+      <p style="margin-bottom:0">
+        默认所有 Pod 的 <code>schedulerName</code> 都是 <code>default-scheduler</code>，
+        走的是原生调度流程，根本不会经过 HAMi。<br><br>
+        HAMi 的 webhook 就像一个站在门口的人：
+        看到有人要 GPU，就悄悄把他手上的门牌号从「1 号楼」改成「2 号楼」（<code>hami-scheduler</code>），
+        这样他才会被送到 HAMi 这栋楼里来处理。
+        <br><br>
+        如果没有这一步，用户就必须在每个 YAML 里手写 <code>schedulerName: hami-scheduler</code>。对用户来说是心智负担，也没法给存量应用无侵入接入。
+      </p>
+    </div>
+
+    <h2>2. 挂载点：一个 HTTP 路由</h2>
+
+    <p>webhook 跟 filter / bind 挂在同一个 HTTP server 上，就是一条路由：</p>
+
+    <div class="codeblock" data-file="cmd/scheduler/main.go" data-start="144" data-lang="go" data-hl="6">
+<pre><code>	// start http server
+	router := httprouter.New()
+	router.POST("/filter", routes.PredicateRoute(sher))
+	router.POST("/bind", routes.Bind(sher))
+	router.POST("/refit", routes.NumaRefit(sher))
+	router.POST("/webhook", routes.WebHookRoute())      // ← 就是这一条
+	router.GET("/healthz", routes.HealthzRoute())
+	router.GET("/readyz", routes.ReadyzRoute(sher))
+	klog.Info("listen on ", config.HTTPBind)</code></pre>
+    </div>
+
+    <p>
+      路由处理器本身极薄，把活全交给 controller-runtime 的 admission 框架：
+    </p>
+
+    <div class="codeblock" data-file="pkg/scheduler/routes/route.go" data-start="158" data-lang="go">
+<pre><code>func WebHookRoute() httprouter.Handle {
+	h, err := scheduler.NewWebHook()
+	if err != nil {
+		klog.ErrorS(err, "Failed to create new webhook")
+	}
+	return func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+		klog.V(5).Infof("Handling webhook request on %s", r.URL.Path)
+		h.ServeHTTP(w, r)          // 委托给 admission.Webhook
+	}
+}</code></pre>
+    </div>
+
+    <div class="codeblock" data-file="pkg/scheduler/webhook.go" data-start="43" data-lang="go" data-hl="6-8">
+<pre><code>func NewWebHook() (*admission.Webhook, error) {
+	logf.SetLogger(klog.NewKlogr())
+	schema := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(schema); err != nil {
+		return nil, err
+	}
+	decoder := admission.NewDecoder(schema)
+	wh := &amp;admission.Webhook{Handler: &amp;webhook{decoder: decoder}}   // 我们的 Handler
+	return wh, nil
+}</code></pre>
+    </div>
+
+    <div class="note warn">
+      <div class="t">集群侧还需要一个 MutatingWebhookConfiguration</div>
+      <p style="margin-bottom:0">
+        光有 HTTP 端点不够，还得告诉 apiserver「创建 Pod 时来调我」。
+        这个配置在 Helm chart 里：<code>charts/hami/templates/scheduler/webhook.yaml</code>。
+        <br>它有一个关键设置 <code>failurePolicy</code>：如果设成 <code>Fail</code>，
+        webhook 挂掉会导致<strong>整个集群创建不了 Pod</strong>；设成 <code>Ignore</code> 则 HAMi 挂了之后
+        GPU Pod 会走默认调度器（然后 Fit 不到，一直 Pending）。
+        <br><em>生产环境这是个经典坑，值得看一眼 chart 里到底怎么配的。</em>
+      </p>
+    </div>
+
+    <h2>3. Handle() 全流程：8 个步骤</h2>
+
+    <p>
+      这个函数只有 88 行，但它是整条链路上唯一能修改 Pod 的地方，
+      每一行都有明确目的。我们逐段拆。
+    </p>
+
+    <div class="lab">
+      <header>Webhook 决策模拟器<span class="badge">互动</span></header>
+      <div class="body">
+        <p style="font-size:13.5px;color:var(--fg-soft);margin-bottom:12px">
+          勾选 Pod 的特征，看 webhook 会怎么处理它 —— 走到第几步、Allow 还是 Deny、改了什么。
+        </p>
+        <div id="whControls"></div>
+        <div class="out" id="whOut"></div>
+      </div>
+    </div>
+
+    <h3>Step 1-2：解码 + 空容器检查</h3>
+
+    <div class="codeblock" data-file="pkg/scheduler/webhook.go" data-start="54" data-lang="go" data-hl="8-11">
+<pre><code>func (h *webhook) Handle(_ context.Context, req admission.Request) admission.Response {
+	pod := &amp;corev1.Pod{}
+	err := h.decoder.Decode(req, pod)
+	if err != nil {
+		klog.Errorf("Failed to decode request: %v", err)
+		return admission.Errored(http.StatusBadRequest, err)
+	}
+	if len(pod.Spec.Containers) == 0 {
+		klog.Warningf(template+" - Denying admission as pod has no containers", pod.Namespace, pod.Name, pod.UID)
+		return admission.Denied("pod has no containers")          // ① 拒绝
+	}</code></pre>
+    </div>
+
+    <h3>Step 3：已经有别的调度器？放行</h3>
+
+    <div class="codeblock" data-file="pkg/scheduler/webhook.go" data-start="65" data-lang="go" data-hl="1-6">
+<pre><code>	if pod.Spec.SchedulerName != "" &amp;&amp;
+		(pod.Spec.SchedulerName != corev1.DefaultSchedulerName || !config.ForceOverwriteDefaultScheduler) &amp;&amp;
+		(len(config.SchedulerName) == 0 || pod.Spec.SchedulerName != config.SchedulerName) {
+		klog.V(3).Infof(template+" - Pod already has different scheduler assigned", req.Namespace, req.Name, req.UID)
+		return admission.Allowed("pod already has different scheduler assigned")
+	}</code></pre>
+    </div>
+
+    <div class="note">
+      <div class="t">这个三重条件在说什么</div>
+      <p>
+        翻译成人话：「如果用户已经明确指定了一个不是我的调度器，我就不插手。」
+      </p>
+      <ul style="margin-bottom:0">
+        <li>条件 1：<code>schedulerName</code> 不为空（用户确实指定了）</li>
+        <li>条件 2：不是 <code>default-scheduler</code>，<b>或者</b>虽然是默认但配置说了不允许覆盖
+          （<code>ForceOverwriteDefaultScheduler</code> 默认是 <code>true</code>，
+          见 <span data-srcref="cmd/scheduler/main.go:81"></span>）</li>
+        <li>条件 3：也不是 HAMi 自己（避免重复处理）</li>
+      </ul>
+    </div>
+
+    <h3>Step 4：校验 numa-alignment 注解</h3>
+
+    <div class="codeblock" data-file="pkg/scheduler/webhook.go" data-start="71" data-lang="go" data-hl="1-6">
+<pre><code>	// Reject invalid numa-alignment values at admission, so a typo surfaces
+	// to the user instead of only appearing in a device-plugin log later.
+	if _, err := util.GetNumaAlignmentModeByPod(pod); err != nil {
+		klog.Warningf(template+" - Denying admission: %v", pod.Namespace, pod.Name, pod.UID, err)
+		return admission.Denied(err.Error())                      // ② 拒绝
+	}</code></pre>
+    </div>
+
+    <div class="note tip">
+      <div class="t">注意这段注释体现的设计哲学</div>
+      <p style="margin-bottom:0">
+        「让拼写错误立刻暴露给用户，而不是几分钟后埋在设备插件的日志里。」
+        <br>在准入阶段就拒绝非法输入，比让它一路走下去在深处失败要好得多。用户 <code>kubectl apply</code> 的那一刻就能看到错误信息。
+        这是贯穿整个 webhook 的思路。
+      </p>
+    </div>
+
+    <h3>Step 5：核心：遍历所有容器调 MutateAdmission</h3>
+
+    <div class="codeblock" data-file="pkg/scheduler/webhook.go" data-start="78" data-lang="go" data-hl="1,3-4,6,11,15,17-18">
+<pre><code>	privilegedName, hasPrivileged := privilegedContainerName(pod)
+	hasResource := false
+
+	// 1. Process InitContainers
+	for idx := range pod.Spec.InitContainers {
+		c := &amp;pod.Spec.InitContainers[idx]
+		for _, val := range device.GetDevices() {              // 遍历 12 家厂商
+			found, err := val.MutateAdmission(c, pod)          // ← 每家都问一遍
+			if err != nil {
+				klog.Errorf("validating pod failed:%s", err.Error())
+				return admission.Errored(http.StatusInternalServerError, err)
+			}
+			hasResource = hasResource || found                 // 任一家认领了就算用了 GPU
+		}
+	}
+
+	// 2. Process Regular Containers (Keep your existing loop here)
+	for idx := range pod.Spec.Containers {
+		c := &amp;pod.Spec.Containers[idx]
+		for _, val := range device.GetDevices() {
+			found, err := val.MutateAdmission(c, pod)
+			if err != nil {
+				klog.Errorf("validating pod failed:%s", err.Error())
+				return admission.Errored(http.StatusInternalServerError, err)
+			}
+			hasResource = hasResource || found
+		}
+	}</code></pre>
+    </div>
+
+    <div class="note trap">
+      <div class="t">踩坑：<code>&amp;pod.Spec.Containers[idx]</code> 而不是 <code>range</code> 的值</div>
+      <p style="margin-bottom:0">
+        注意循环写法是 <code>for idx := range</code> 然后取 <code>&amp;pod.Spec.Containers[idx]</code>，
+        <strong>不是</strong> <code>for _, c := range pod.Spec.Containers</code>。
+        因为 <code>MutateAdmission</code> 要<strong>真正修改容器</strong>（加环境变量、补 limits），
+        必须拿到切片元素的指针。如果用 range 的值拷贝，改了个寂寞。
+        <br><em>这是 Go 里非常经典的坑，读到别的项目也要留意。</em>
+      </p>
+    </div>
+
+    <h3>Step 6-7：三种拒绝 + 改 schedulerName</h3>
+
+    <div class="codeblock" data-file="pkg/scheduler/webhook.go" data-start="106" data-lang="go" data-hl="4-7,9-12,17-18,20-23,26-28">
+<pre><code>	// Validate device-scoring weights for HAMi workloads so malformed input is
+	// reported before scheduling. The scheduler retains the same validation as
+	// a defense-in-depth check.
+	if hasResource {
+		if _, err := util.GetDeviceScoringWeightsByPod(pod); err != nil {
+			klog.Warningf(template+" - Denying admission: %v", pod.Namespace, pod.Name, pod.UID, err)
+			return admission.Denied(err.Error())                  // ③ 拒绝：打分权重非法
+		}
+	}
+	if hasPrivileged &amp;&amp; hasResource {
+		klog.Warningf(template+" - Denying admission as container %s is privileged", ...)
+		return admission.Denied(fmt.Sprintf("container %s is privileged", privilegedName))  // ④ 拒绝：特权容器
+	}
+
+	if !hasResource {
+		klog.V(3).Infof(template+" - Allowing admission: no GPU resource found", ...)
+		//return admission.Allowed("no resource found")
+	} else if len(config.SchedulerName) &gt; 0 {
+		pod.Spec.SchedulerName = config.SchedulerName             // 核心：改门牌号
+		if pod.Spec.NodeName != "" {
+			klog.Infof(template+" - Pod already has node assigned", ...)
+			return admission.Denied("pod has node assigned")      // ⑤ 拒绝：已指定 nodeName
+		}
+	}
+
+	if !fitResourceQuota(pod) {
+		return admission.Denied("exceeding resource quota")        // ⑥ 拒绝：超配额
+	}</code></pre>
+    </div>
+
+    <div class="note trap">
+      <div class="t">为什么「特权容器 + GPU」要拒绝</div>
+      <p style="margin-bottom:0">
+        特权容器可以绕过 HAMi-core 的劫持：它能直接访问 <code>/dev/nvidia*</code>，
+        自己加载真正的 <code>libcuda.so</code>，显存和算力限制形同虚设。
+        允许它进来就等于允许一个租户偷偷占满整张卡，影响其他租户。所以直接拒。
+        <br>注意判断是 <code>hasPrivileged &amp;&amp; hasResource</code>。不用 GPU 的特权容器是允许的（比如各种 agent DaemonSet）。
+      </p>
+    </div>
+
+    <div class="note trap">
+      <div class="t">为什么指定了 <code>nodeName</code> 要拒绝</div>
+      <p style="margin-bottom:0">
+        直接写 <code>spec.nodeName</code> 会<strong>完全跳过调度器</strong>，kubelet 直接开跑。
+        那 HAMi 就没机会写「用哪张卡」的注解，设备插件在 <code>Allocate()</code> 里
+        读不到注解就会失败。所以必须在准入时挡住。
+        <br>这也是 <code>DecodeContainerDevices</code> 里那句错误信息的来历：
+        <code>"pod annotation format error, missing fields, do not use nodeName in task spec"</code>。
+      </p>
+    </div>
+
+    <h3>Step 8：生成 JSON Patch 返回</h3>
+
+    <div class="codeblock" data-file="pkg/scheduler/webhook.go" data-start="133" data-lang="go" data-hl="6">
+<pre><code>	marshaledPod, err := json.Marshal(pod)
+	if err != nil {
+		klog.Errorf(template+" - Failed to marshal pod, error: %v", pod.Namespace, pod.Name, pod.UID, err)
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+	return admission.PatchResponseFromRaw(req.Object.Raw, marshaledPod)   // 自动算 diff
+}</code></pre>
+    </div>
+
+    <p>
+      <code>PatchResponseFromRaw</code> 会自动比较「原始 Pod」和「改过的 Pod」，
+      生成 <a href="https://jsonpatch.com/" target="_blank" rel="noopener">JSON Patch</a> 返回给 apiserver。
+      我们不用手写 patch 路径，改结构体就行。
+    </p>
+
+    <h2>4. MutateAdmission 到底改了什么</h2>
+
+    <p>以 NVIDIA 为例，这个方法做五件事：</p>
+
+    <div class="codeblock" data-file="pkg/device/nvidia/device.go" data-start="334" data-lang="go" data-hl="3-8,10-16,18-24,26-29,31-36,38-43">
+<pre><code>func (dev *NvidiaGPUDevices) MutateAdmission(ctr *corev1.Container, p *corev1.Pod) (bool, error) {
+	/*gpu related */
+	if err := dev.validateMemoryPercentage(ctr); err != nil {      // ① 校验显存百分比范围
+		return false, err
+	}
+	if err := dev.validateCores(ctr); err != nil {                 // ② 校验算力范围
+		return false, err
+	}
+	priority, ok := ctr.Resources.Limits[corev1.ResourceName(dev.config.ResourcePriority)]
+	if ok {
+		ctr.Env = append(ctr.Env, corev1.EnvVar{                   // ③ 优先级 → 环境变量
+			Name:  util.TaskPriority,                              //    CUDA_TASK_PRIORITY
+			Value: fmt.Sprint(priority.Value()),
+		})
+	}
+
+	if dev.config.GPUCorePolicy != "" &amp;&amp;
+		dev.config.GPUCorePolicy != DefaultCorePolicy {
+		ctr.Env = append(ctr.Env, corev1.EnvVar{                   // ④ 算力策略 → 环境变量
+			Name:  util.CoreLimitSwitch,                           //    GPU_CORE_UTILIZATION_POLICY
+			Value: string(dev.config.GPUCorePolicy),
+		})
+	}
+
+	hasResource := dev.mutateContainerResource(ctr)                // ⑤ 补默认卡数
+	if dev.defaultExclusiveCoreIfNeeded(ctr) {                     // ⑥ 补独占算力
+		hasResource = true
+	}
+
+	if hasResource {
+		// Set runtime class name if it is not set by user and the runtime class name is configured
+		if p.Spec.RuntimeClassName == nil &amp;&amp; dev.config.RuntimeClassName != "" {
+			p.Spec.RuntimeClassName = &amp;dev.config.RuntimeClassName // ⑦ 补 RuntimeClass
+		}
+	}
+
+	if !hasResource &amp;&amp; dev.config.OverwriteEnv {
+		ctr.Env = append(ctr.Env, corev1.EnvVar{                   // ⑧ 不用 GPU 的容器：屏蔽所有卡
+			Name:  "NVIDIA_VISIBLE_DEVICES",
+			Value: "none",
+		})
+	}
+	return hasResource, nil
+}</code></pre>
+    </div>
+
+    <h3>4.1 「只写显存不写卡数」的自动补全</h3>
+
+    <p>用户经常这么写 YAML：</p>
+
+    <div class="codeblock" data-lang="yaml" data-title="用户写的（不完整）">
+<pre><code>resources:
+  limits:
+    nvidia.com/gpumem: 3000     # 只说要 3000MB 显存
+                                # 但没说要几张卡！</code></pre>
+    </div>
+
+    <p>HAMi 帮他补上：</p>
+
+    <div class="codeblock" data-file="pkg/device/nvidia/device.go" data-start="406" data-lang="go" data-hl="2-5,11-16">
+<pre><code>func (dev *NvidiaGPUDevices) mutateContainerResource(ctr *corev1.Container) bool {
+	_, resourceNameOK := ctr.Resources.Limits[corev1.ResourceName(dev.config.ResourceCountName)]
+	if resourceNameOK {
+		return true                                    // 已经写了 nvidia.com/gpu，不用管
+	}
+
+	_, resourceCoresOK := ctr.Resources.Limits[corev1.ResourceName(dev.config.ResourceCoreName)]
+	_, resourceMemOK := ctr.Resources.Limits[corev1.ResourceName(dev.config.ResourceMemoryName)]
+	_, resourceMemPercentageOK := ctr.Resources.Limits[corev1.ResourceName(dev.config.ResourceMemoryPercentageName)]
+
+	if resourceCoresOK || resourceMemOK || resourceMemPercentageOK {
+		if dev.config.DefaultGPUNum &gt; 0 {              // 写了显存/算力但没写卡数
+			ctr.Resources.Limits[corev1.ResourceName(dev.config.ResourceCountName)] =
+				*resource.NewQuantity(int64(dev.config.DefaultGPUNum), resource.BinarySI)   // 补 1 张
+			return true
+		}
+	}
+	return false                                       // 完全没提 GPU，不是我的活
+}</code></pre>
+    </div>
+
+    <h3>4.2 「不写算力 = 独占整卡」的隐式规则</h3>
+
+    <p>这条规则很容易踩坑，值得单独看：</p>
+
+    <div class="codeblock" data-file="pkg/device/nvidia/device.go" data-start="425" data-lang="go" data-hl="6-9,11-14,16-22,31-32">
+<pre><code>func (dev *NvidiaGPUDevices) defaultExclusiveCoreIfNeeded(ctr *corev1.Container) bool {
+	if ctr == nil {
+		return false
+	}
+
+	countName := corev1.ResourceName(dev.config.ResourceCountName)
+	if countName == "" || !resourcePresent(ctr, countName) {
+		return false                                   // 没申请卡数 → 不管
+	}
+
+	coreName := corev1.ResourceName(dev.config.ResourceCoreName)
+	if coreName == "" || resourcePresent(ctr, coreName) {
+		return false                                   // 已经明写了算力 → 尊重用户
+	}
+
+	exclusive := false
+	if pct, ok := resourceValue(ctr, corev1.ResourceName(dev.config.ResourceMemoryPercentageName)); ok {
+		exclusive = pct == 100                         // 显存要 100% → 那算力也给满
+	} else if dev.config.ResourceMemoryName == "" {
+		exclusive = true
+	} else if _, ok := resourceValue(ctr, corev1.ResourceName(dev.config.ResourceMemoryName)); !ok {
+		exclusive = true                               // 显存也没写 → 就是要整卡
+	}
+
+	if !exclusive {
+		return false
+	}
+
+	if ctr.Resources.Limits == nil {
+		ctr.Resources.Limits = corev1.ResourceList{}
+	}
+	ctr.Resources.Limits[coreName] = *resource.NewQuantity(100, resource.DecimalSI)  // 算力 = 100
+	return true
+}</code></pre>
+    </div>
+
+    <div class="note warn">
+      <div class="t">这条规则的实际影响</div>
+      <div class="tbl-wrap">
+      <table>
+        <tr><th style="width:260px">用户写的</th><th>HAMi 补成</th><th>效果</th></tr>
+        <tr><td><code>gpu: 1</code></td><td><code>gpu:1, gpucores:100</code></td><td><b>独占整卡</b>，跟原生 K8s 行为一致</td></tr>
+        <tr><td><code>gpu: 1, gpumem: 3000</code></td><td>不补</td><td>共享卡，算力用默认值（<code>DefaultCores</code>，通常 0 = 不限）</td></tr>
+        <tr><td><code>gpumem: 3000</code></td><td><code>gpu:1, gpumem:3000</code></td><td>共享卡</td></tr>
+        <tr><td><code>gpu:1, gpumem-percentage:100</code></td><td><code>+ gpucores:100</code></td><td><b>独占整卡</b></td></tr>
+      </table>
+      </div>
+      <p style="margin-bottom:0">
+        关键：只写 <code>nvidia.com/gpu: 1</code> 是独占，不是共享。
+        这个设计保证了「存量应用直接接入 HAMi，行为不变」，
+        但也让不少人第一次用时困惑「为什么我的卡没被共享」。
+      </p>
+    </div>
+
+    <h2>5. 配额检查：一个容易忽略的复杂点</h2>
+
+    <p>
+      最后一步 <code>fitResourceQuota()</code> 里有一段不太显眼但容易算错的逻辑：
+      怎么算一个 Pod 真正的资源峰值。
+    </p>
+
+    <div class="codeblock" data-file="pkg/scheduler/webhook.go" data-start="161" data-lang="go" data-hl="7-10,13-20,22-40,42-43">
+<pre><code>func fitResourceQuota(pod *corev1.Pod) bool {
+	for deviceName, dev := range device.GetDevices() {
+		resourceNames := dev.GetResourceNames()
+		if len(resourceNames.ResourceMemoryName) == 0 &amp;&amp; len(resourceNames.ResourceCoreName) == 0 {
+			continue                                   // 这家厂商不支持显存/算力配额，跳过
+		}
+
+		// Ask the backend what the pod is requesting rather than reading the
+		// container spec here. It applies its own memory factor, defaults and
+		// template rounding, which is what the scheduler later records as used,
+		// so this keeps admission and the scheduler on the same numbers.
+		var appMemoryReq, appCoresReq int64
+		for i := range pod.Spec.Containers {
+			req := dev.GenerateResourceRequests(&amp;pod.Spec.Containers[i])
+			if req.Nums == 0 {
+				continue
+			}
+			appMemoryReq += int64(req.Memreq) * int64(req.Nums)     // 普通容器：累加
+			appCoresReq  += int64(req.Coresreq) * int64(req.Nums)
+		}
+
+		var initPeakMemoryReq, initPeakCoresReq int64
+		var sidecarMemoryReq, sidecarCoresReq int64
+		for i := range pod.Spec.InitContainers {
+			c := &amp;pod.Spec.InitContainers[i]
+			req := dev.GenerateResourceRequests(c)
+			if req.Nums == 0 {
+				continue
+			}
+			mem := int64(req.Memreq) * int64(req.Nums)
+			cores := int64(req.Coresreq) * int64(req.Nums)
+			if util.IsSidecarContainer(c) {                         // Sidecar：跟普通容器同时活着
+				sidecarMemoryReq += mem
+				sidecarCoresReq += cores
+				initPeakMemoryReq = max(initPeakMemoryReq, sidecarMemoryReq)
+				initPeakCoresReq = max(initPeakCoresReq, sidecarCoresReq)
+				continue
+			}
+			initPeakMemoryReq = max(initPeakMemoryReq, sidecarMemoryReq+mem)  // 普通 Init：串行，取峰值
+			initPeakCoresReq = max(initPeakCoresReq, sidecarCoresReq+cores)
+		}
+
+		memoryReq := max(initPeakMemoryReq, sidecarMemoryReq+appMemoryReq)   // 全局峰值
+		coresReq  := max(initPeakCoresReq,  sidecarCoresReq+appCoresReq)
+		if memoryReq == 0 &amp;&amp; coresReq == 0 {
+			continue
+		}
+		...
+		if !device.GetLocalCache().FitQuota(pod.Namespace, memoryReq, resourceNames.MemoryFactor, coresReq, deviceName) {
+			klog.Infof(template+" - Denying admission", pod.Namespace, pod.Name, pod.UID)
+			return false
+		}
+	}
+	return true
+}</code></pre>
+    </div>
+
+    <div class="note tip">
+      <div class="t">三类容器，三种资源占用模型</div>
+      <div class="tbl-wrap">
+      <table>
+        <tr><th style="width:130px">容器类型</th><th style="width:110px">何时活着</th><th>资源怎么算</th></tr>
+        <tr><td>普通 Container</td><td>Pod 整个生命周期</td><td><b>累加</b>（它们同时运行）</td></tr>
+        <tr><td>普通 InitContainer</td><td>串行，一个跑完下一个</td><td><b>取最大值</b>（同一时刻只有一个在跑）</td></tr>
+        <tr><td>Sidecar InitContainer<br><span style="font-size:11.5px;color:var(--fg-mute)">restartPolicy: Always</span></td><td>启动后一直活到 Pod 结束</td><td><b>累加</b>，而且要加到后面每一项上</td></tr>
+      </table>
+      </div>
+      <p style="margin-bottom:0">
+        最终公式 <code>max(init 阶段峰值, sidecar + 所有普通容器)</code> 就是这么来的。
+        <br>这段逻辑在第 05 章打分时会<strong>再出现一次</strong>（<code>allocateInitContainers</code>），
+        因为调度时也要按同样的模型试算。
+      </p>
+    </div>
+
+    <h2>6. 动手实验</h2>
+
+    <ol class="steps">
+      <li>
+        <span class="st">跑 MutateAdmission 的全部测试</span>
+        <div class="codeblock" data-lang="bash"><pre><code>go test ./pkg/device/nvidia/ -run "Test_MutateAdmission" -v -count=1
+go test ./pkg/device/nvidia/ -run "TestMutateAdmissionDefaultsExclusiveCore" -v -count=1</code></pre></div>
+      </li>
+      <li>
+        <span class="st">验证「只写 gpumem 会被补成 gpu:1」</span>
+        <div class="codeblock" data-lang="bash"><pre><code># 打开测试文件，找到只设 gpumem 的那个用例，看它的 want
+sed -n '45,130p' pkg/device/nvidia/device_test.go</code></pre></div>
+      </li>
+      <li>
+        <span class="st">跑 webhook 层的测试</span>
+        <div class="codeblock" data-lang="bash"><pre><code>go test ./pkg/scheduler/ -run "TestWebhook|Test_Handle" -v -count=1
+# webhook_test.go 有 1355 行，覆盖了各种拒绝场景
+grep -n "^func Test" pkg/scheduler/webhook_test.go</code></pre></div>
+      </li>
+      <li>
+        <span class="st">找到 Helm chart 里的 webhook 配置</span>
+        <div class="codeblock" data-lang="bash"><pre><code>find charts -name "*webhook*"
+grep -rn "failurePolicy\|objectSelector\|namespaceSelector" charts/hami/templates/ | head</code></pre></div>
+        <p style="font-size:13.5px;color:var(--fg-soft)">
+          重点看 <code>failurePolicy</code> 和 selector —— 这决定了 HAMi 挂掉时集群会怎样。
+        </p>
+      </li>
+    </ol>
+
+    <h2>7. 本章自测</h2>
+
+    <div class="quiz" data-answer="C">
+      <div class="q">如果把 HAMi 的 MutatingWebhookConfiguration 删掉，会发生什么？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>没影响，调度器照常工作</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>集群里所有 Pod 都创建不了</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>GPU Pod 的 <code>schedulerName</code> 保持 <code>default-scheduler</code>，永远不会走到 HAMi</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>GPU Pod 会被随机调度到任意节点</span></div>
+      <div class="expl">
+        调度器扩展器是按 schedulerName 绑定的。
+        没有 webhook 改门牌号，Pod 就走原生 default-scheduler，HAMi 的 <code>/filter</code> 根本不会被调用，
+        也就不会有分配注解。这时 Pod 会被原生调度器按 <code>nvidia.com/gpu</code> 整卡分配
+        （如果集群里还有官方 device plugin），或者一直 Pending。
+        <br>用户可以自己在 YAML 里手写 <code>schedulerName: hami-scheduler</code> 绕过 —— 这也是排查问题时的验证手段。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="B">
+      <div class="q">下面这个容器，webhook 处理后的 <code>limits</code> 是什么？<br>
+        <code style="display:block;margin-top:6px;white-space:pre">limits:
+  nvidia.com/gpu: 1</code></div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>不变，还是只有 <code>nvidia.com/gpu: 1</code></span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>补上 <code>nvidia.com/gpucores: 100</code>，变成独占整卡</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>补上 <code>nvidia.com/gpumem: 默认值</code></span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>被拒绝，因为没指定显存</span></div>
+      <div class="expl">
+        <code>defaultExclusiveCoreIfNeeded()</code> 的逻辑：
+        申请了卡数 + 没写算力 + 没写显存 → 判定为「用户想要整卡」，补 <code>gpucores: 100</code>。
+        <br>这保证了<strong>存量应用无缝接入</strong>：原来独占一张卡，接入 HAMi 后还是独占。
+        想共享必须<strong>显式</strong>写 <code>gpumem</code> 或 <code>gpucores</code>。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="D">
+      <div class="q">一个 Pod 有：1 个普通 InitContainer 要 4000MB，1 个 Sidecar InitContainer 要 1000MB，2 个普通容器各要 3000MB。配额检查算出的显存需求是多少？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>4000（取最大）</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>11000（全部累加）</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>6000（只算普通容器）</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>7000</span></div>
+      <div class="expl">
+        按公式 <code>max(initPeak, sidecar + app)</code> 算：
+        <ul style="margin:8px 0 0">
+          <li><code>sidecarMemoryReq</code> = 1000</li>
+          <li><code>initPeak</code> = max(1000, 1000+4000) = <b>5000</b>（Init 阶段：sidecar 已启动 + 普通 init 在跑）</li>
+          <li><code>app</code> = 3000 + 3000 = 6000</li>
+          <li>结果 = max(5000, 1000 + 6000) = <b>7000</b></li>
+        </ul>
+        关键在于 Sidecar（<code>restartPolicy: Always</code> 的 InitContainer）在整个 Pod 生命周期都活着，
+        所以要加到每一项上；而普通 InitContainer 跑完就退出，只在 Init 阶段占资源。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="A">
+      <div class="q">为什么 webhook 循环写成 <code>for idx := range pod.Spec.Containers</code> 再取 <code>&amp;pod.Spec.Containers[idx]</code>？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>必须拿到切片元素的指针，才能真正修改容器（加 env、补 limits）</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>性能更好，避免结构体拷贝</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>为了兼容旧版本 Go</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>习惯写法，没有实际区别</span></div>
+      <div class="expl">
+        <code>MutateAdmission</code> 会往 <code>ctr.Env</code> 追加环境变量、
+        往 <code>ctr.Resources.Limits</code> 写默认值。如果用 <code>for _, c := range</code>，
+        <code>c</code> 是<strong>值拷贝</strong>，改它对原 Pod 毫无影响，
+        最后 <code>json.Marshal(pod)</code> 出来的还是原样，patch 是空的。
+        <br>B 也算是个副作用（<code>corev1.Container</code> 结构体很大），但不是主要原因。
+      </div>
+    </div>
+
+    <h2>8. 小结</h2>
+
+    <ul>
+      <li>Webhook 的<b>头号任务</b>是把 <code>schedulerName</code> 改成 <code>hami-scheduler</code>，
+          否则 HAMi 根本不会被调用。</li>
+      <li>它是整条链路上唯一能修改 Pod 的地方，之后只能加注解不能改 spec。</li>
+      <li>五种拒绝：无容器、numa-alignment 非法、打分权重非法、<b>特权容器 + GPU</b>、<b>已指定 nodeName</b>、超配额。</li>
+      <li>自动补全两条隐式规则：<b>写了显存补卡数</b>、只写卡数补 gpucores=100（独占）。</li>
+      <li>配额峰值公式 <code>max(initPeak, sidecar + app)</code>，
+          三类容器三种占用模型 —— 第 05 章打分时会再遇到一次。</li>
+      <li>循环用<b>索引取指针</b>，因为要真正修改容器。</li>
+    </ul>
+
+    <p class="next-hint">Pod 的 <code>schedulerName</code> 已经被改成 <code>hami-scheduler</code>，
+        kube-scheduler 开始调用 HAMi 的 <code>/filter</code> 接口。
+        下一章我们走进调度器主流程：从 HTTP 请求进来，到选出一个节点写进注解，中间发生了什么。</p>
+
+    <div class="chapter-nav" id="chapterNav"></div>
+  </main>
+</div>
+
+<script src="../assets/js/site.js"></script>
+<script>
+/* ========== Webhook 决策模拟器 ========== */
+(function () {
+  const OPTS = [
+    { k: 'noCtr',      label: 'Pod 没有任何容器', def: false },
+    { k: 'otherSched', label: '已指定 schedulerName: volcano', def: false },
+    { k: 'badNuma',    label: '有非法的 hami.io/numa-alignment 注解', def: false },
+    { k: 'gpu',        label: '容器申请了 nvidia.com/gpu: 1', def: true },
+    { k: 'mem',        label: '容器申请了 nvidia.com/gpumem: 3000', def: false },
+    { k: 'cores',      label: '容器申请了 nvidia.com/gpucores: 30', def: false },
+    { k: 'badWeights', label: '有非法的 hami.io/device-scoring-weights 注解', def: false },
+    { k: 'privileged', label: '有 privileged: true 的容器', def: false },
+    { k: 'nodeName',   label: '直接指定了 spec.nodeName', def: false },
+    { k: 'overQuota',  label: '超出了命名空间 ResourceQuota', def: false },
+  ];
+  const state = {};
+  OPTS.forEach(o => state[o.k] = o.def);
+
+  const host = document.getElementById('whControls');
+  const out = document.getElementById('whOut');
+  host.innerHTML = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:4px">' +
+    OPTS.map(o => `<label style="display:flex;gap:8px;align-items:center;font-size:13px;cursor:pointer;padding:3px 0">
+      <input type="checkbox" data-k="${o.k}" ${o.def ? 'checked' : ''} style="accent-color:var(--accent);width:15px;height:15px">
+      <span>${o.label}</span></label>`).join('') + '</div>';
+
+  host.querySelectorAll('input').forEach(i => i.addEventListener('change', () => {
+    state[i.dataset.k] = i.checked; run();
+  }));
+
+  function run() {
+    const L = [];
+    const deny = (step, msg, why) => {
+      L.push(`\n<span class="bad">✗ Step ${step} → admission.Denied("${msg}")</span>`);
+      L.push(`<span class="dim">   ${why}</span>`);
+      L.push(`\n<span class="bad">kubectl apply 会立刻报错，Pod 根本不会被创建。</span>`);
+      out.innerHTML = L.join('\n');
+    };
+
+    L.push('<span class="key">webhook.Handle() 执行轨迹</span>');
+    L.push('<span class="dim">pkg/scheduler/webhook.go:54</span>\n');
+
+    L.push('<span class="ok">✓ Step 1</span> 解码 AdmissionRequest → *corev1.Pod');
+
+    if (state.noCtr) return deny(2, 'pod has no containers', '连容器都没有，没什么可处理的。');
+    L.push('<span class="ok">✓ Step 2</span> 检查 len(pod.Spec.Containers) > 0');
+
+    if (state.otherSched) {
+      L.push('<span class="warn">→ Step 3</span> 检测到 schedulerName = "volcano"');
+      L.push('\n<span class="ok">✓ admission.Allowed("pod already has different scheduler assigned")</span>');
+      L.push('<span class="dim">   用户明确指定了别的调度器，HAMi 不插手。</span>');
+      L.push('<span class="dim">   注意：Pod 会被原样放行，HAMi 不会给它分配 GPU。</span>');
+      out.innerHTML = L.join('\n'); return;
+    }
+    L.push('<span class="ok">✓ Step 3</span> schedulerName 为空或是 default-scheduler → 可以接管');
+
+    if (state.badNuma) return deny(4, 'invalid numa-alignment mode', 'GetNumaAlignmentModeByPod 返回 error。在准入就拒绝，让用户立刻看到拼写错误。');
+    L.push('<span class="ok">✓ Step 4</span> hami.io/numa-alignment 校验通过');
+
+    // Step 5: MutateAdmission
+    const hasResource = state.gpu || state.mem || state.cores;
+    L.push('\n<span class="key">→ Step 5</span> 遍历所有容器 × 所有厂商，调 MutateAdmission()');
+    if (!hasResource) {
+      L.push('  <span class="dim">所有厂商都返回 found=false → hasResource = false</span>');
+      L.push('  <span class="dim">若 config.OverwriteEnv 开启，会注入 NVIDIA_VISIBLE_DEVICES=none</span>');
+    } else {
+      L.push('  <span class="ok">NVIDIA 后端返回 found=true → hasResource = true</span>');
+      const patches = [];
+      if (!state.gpu && (state.mem || state.cores)) {
+        patches.push('补 <span class="ok">nvidia.com/gpu: 1</span>   <span class="dim">← mutateContainerResource：写了显存/算力但没写卡数</span>');
+      }
+      if (state.gpu && !state.cores && !state.mem) {
+        patches.push('补 <span class="ok">nvidia.com/gpucores: 100</span>   <span class="dim">← defaultExclusiveCoreIfNeeded：判定为想要独占整卡</span>');
+      }
+      patches.push('可能补 <span class="ok">spec.runtimeClassName</span>   <span class="dim">← 如果配置了且用户没写</span>');
+      patches.forEach(p => L.push('  ' + p));
+    }
+
+    if (hasResource && state.badWeights) return deny(6, '<权重解析错误>', 'hasResource=true 时才校验 device-scoring-weights。');
+    if (hasResource) L.push('<span class="ok">✓ Step 6</span> device-scoring-weights 校验通过');
+
+    if (state.privileged && hasResource) {
+      return deny(7, 'container xxx is privileged',
+        '特权容器能直接访问 /dev/nvidia*，绕过 HAMi-core 劫持 → 显存算力限制失效 → 影响同卡其他租户。\n   注意：不用 GPU 的特权容器是允许的。');
+    }
+    if (state.privileged) L.push('<span class="ok">✓ Step 7</span> 有特权容器但不用 GPU → 放行');
+    else L.push('<span class="ok">✓ Step 7</span> 无特权容器');
+
+    if (hasResource) {
+      L.push('\n<span class="key">Step 8</span> <span class="ok">pod.Spec.SchedulerName = "hami-scheduler"</span>');
+      L.push('<span class="dim">   ← 这是 webhook 存在的头号理由。改完之后 kube-scheduler 才会调 HAMi 的 /filter。</span>');
+      if (state.nodeName) {
+        return deny(8, 'pod has node assigned',
+          '指定 nodeName 会完全跳过调度器 → HAMi 没机会写分配注解 → 设备插件 Allocate 时读不到，必然失败。');
+      }
+      L.push('<span class="ok">✓</span> spec.nodeName 为空 → 会正常走调度流程');
+    } else {
+      L.push('\n<span class="dim">→ Step 8 hasResource=false，不改 schedulerName（这个 Pod 跟 HAMi 无关）</span>');
+    }
+
+    if (state.overQuota && hasResource) {
+      return deny(9, 'exceeding resource quota',
+        'fitResourceQuota() 按 max(initPeak, sidecar+app) 算出峰值，超过命名空间 ResourceQuota。');
+    }
+    L.push('<span class="ok">✓ Step 9</span> fitResourceQuota 通过');
+
+    L.push('\n<span class="ok">✓ Step 10 → admission.PatchResponseFromRaw()</span>');
+    L.push('<span class="dim">   自动 diff 原始 Pod 和改过的 Pod，生成 JSON Patch 返回 apiserver。</span>');
+    if (hasResource) {
+      L.push('\n<span class="ok">Pod 被创建，schedulerName=hami-scheduler，下一站：/filter（第 04 章）</span>');
+    } else {
+      L.push('\n<span class="dim">Pod 被创建，走默认调度器，跟 HAMi 无关。</span>');
+    }
+    out.innerHTML = L.join('\n');
+  }
+  run();
+})();
+</script>
+</body>
+</html>

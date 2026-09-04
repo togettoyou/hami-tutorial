@@ -1,0 +1,871 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · NVIDIA 进阶 — HAMi 源码导读</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2316181d'/%3E%3Ctext x='16' y='23' font-size='17' font-family='monospace' font-weight='bold' fill='%23fff' text-anchor='middle'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main class="main">
+
+    <div class="page-kicker">第 10 章 · 第三阶段 硬骨头</div>
+    <h1 class="page-title">NVIDIA 进阶：MIG、NVLink 拓扑、NUMA 回填</h1>
+    <p class="page-lede">
+      这是 HAMi 里技术含量最高的三块，也是最近社区改动最活跃的地方。
+      读懂它们，你在这个项目里就进了前 10%。
+    </p>
+
+    <div class="goals">
+      <h3>学完这章你应该能</h3>
+      <ul>
+        <li>解释 MIG 和 hami-core 两种切分方式的本质区别，以及各自适用场景</li>
+        <li>说清楚 MIG placement 为什么是「区间占位」问题，以及贪心 + 回溯的必要性</li>
+        <li>看懂 NVLink pair score 是怎么算的，以及它如何影响多卡任务的选卡</li>
+        <li>解释 NUMA 回填（refit）解决的是什么问题，为什么需要设备插件反向调用调度器</li>
+        <li>找到这三块的测试文件，能跑起来做实验</li>
+      </ul>
+    </div>
+
+    <h2>1. 两种切分：hami-core vs MIG</h2>
+
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:130px"></th><th>hami-core</th><th>MIG</th></tr>
+      <tr><td>实现层</td><td>用户态 CUDA 劫持（第 09 章）</td><td><b>硬件级</b>，NVIDIA 驱动/固件</td></tr>
+      <tr><td>隔离强度</td><td>防君子不防小人</td><td><b>真隔离</b>：独立 SM、L2、显存控制器</td></tr>
+      <tr><td>切分粒度</td><td>任意（显存 MB + 算力 %）</td><td><b>固定规格</b>（1g.5gb / 2g.10gb / 3g.20gb …）</td></tr>
+      <tr><td>能否超卖</td><td>能（<code>DeviceMemoryScaling</code>）</td><td>不能</td></tr>
+      <tr><td>切换代价</td><td>无，随时改环境变量</td><td>需要创建/销毁 GI + CI，有开销</td></tr>
+      <tr><td>硬件要求</td><td>任意 NVIDIA 卡</td><td>A100 / H100 / A30 等</td></tr>
+      <tr><td>适用</td><td>可信租户之间公平共享</td><td><b>多租户强隔离</b>、SLA 保障</td></tr>
+    </table>
+    </div>
+
+    <p>
+      节点注解的第 9 个字段 <code>Mode</code>（第 01 章）就是标记这个的：
+      <code>hami-core</code> / <code>mig</code> / <code>mps</code>。
+      同一个节点上不同的卡可以是不同模式。
+    </p>
+
+    <h2>2. MIG：一个「区间占位」问题</h2>
+
+    <div class="note analogy">
+      <div class="t">电影院的连座</div>
+      <p style="margin-bottom:0">
+        一张 A100 的显存被划成 <strong>8 个 slice</strong>（可以想成一排 8 个座位）。<br>
+        每种 MIG profile 占用连续的若干个座位：<code>1g.5gb</code> 占 1 个，
+        <code>2g.10gb</code> 占 2 个，<code>3g.20gb</code> 占 4 个（注意不是 3 个！），
+        <code>7g.40gb</code> 占满 8 个。
+        <br><br>
+        <strong>而且不是随便哪几个连座都行</strong>。NVIDIA 规定了每种 profile 允许的起始位置
+        （<code>Placements</code>）。这就是一个典型的<strong>受约束的区间装箱问题</strong>。
+      </p>
+    </div>
+
+    <div class="codeblock" data-file="pkg/device/devices.go" data-start="50" data-lang="go" data-hl="1-4">
+<pre><code>type MigPlacement struct {
+	Start uint32 `json:"start"`      // 从第几个 slice 开始
+	Size  uint32 `json:"size"`       // 占几个 slice
+}
+...
+type MigProfile struct {
+	Name       string         `json:"name"`         // "1g.5gb"
+	MemoryMB   int32          `json:"memoryMB"`
+	Core       int32          `json:"core"`
+	SliceCount uint32         `json:"sliceCount"`
+	Placements []MigPlacement `json:"placements"`   // 这个 profile 允许的所有落位
+
+	// InstanceCount is only used by the device plugin to derive the physical
+	// GPU's advertised replica count. It is not part of the scheduler wire
+	// format because placements already describe schedulable MIG capacity.
+	InstanceCount uint32 `json:"-"`
+}</code></pre>
+    </div>
+
+    <div class="lab">
+      <header>MIG Placement 装箱模拟器<span class="badge">互动</span></header>
+      <div class="body">
+        <p style="font-size:13.5px;color:var(--fg-soft);margin-bottom:12px">
+          A100 的 8 个 slice。依次申请不同规格，看能不能放下、放在哪里。
+          试试先放两个 1g 到两端，再申请 4g —— 看贪心为什么会失败。
+        </p>
+        <div class="field-row">
+          <div style="flex:1 1 200px"><label class="f">申请规格</label>
+            <select id="mig_profile">
+              <option value="1">1g.5gb（占 1 个 slice）</option>
+              <option value="2">2g.10gb（占 2 个）</option>
+              <option value="4">3g.20gb（占 4 个）</option>
+              <option value="8">7g.40gb（占 8 个，整卡）</option>
+            </select>
+          </div>
+        </div>
+        <div class="btns">
+          <button class="btn" id="mig_add">申请（贪心：选最优评分位）</button>
+          <button class="btn ghost" id="mig_addfirst">申请（朴素 first-fit）</button>
+          <button class="btn ghost" id="mig_reset">重置</button>
+        </div>
+        <div id="mig_board" style="margin-top:16px"></div>
+        <div class="out" id="mig_out"></div>
+      </div>
+    </div>
+
+    <h3>2.1 「半区」概念：为什么要给 placement 打分</h3>
+
+    <div class="codeblock" data-file="pkg/device/nvidia/mig_topology.go" data-start="47" data-lang="go" data-hl="1-6,7,9-11,12-14,15-21,22">
+<pre><code>// migRegions splits the card into two halves. The midpoint rounds up because
+// the table ends where the furthest allowed placement ends: an A100 allowlist
+// without 3g or 7g reaches slot 6 only, yet the card is still eight slices
+// wide with its halves at 4. If any placement other than the full-card one
+// straddles the midpoint, the whole card is a single region and scoring
+// degrades to first-fit rather than misplacing on an unknown table.
+func migRegions(profiles []device.MigProfile, sliceCount int) []migRegion {
+	whole := []migRegion{{start: 0, end: uint32(sliceCount)}}
+	if sliceCount &lt; 2 {
+		return whole
+	}
+	mid := uint32((sliceCount + 1) / 2)
+	for _, profile := range profiles {
+		for _, p := range profile.Placements {
+			if p.Size == 0 || p.Size &gt;= uint32(sliceCount) {
+				continue
+			}
+			if p.Start &lt; mid &amp;&amp; p.Start+p.Size &gt; mid {
+				return whole                      // 有 placement 跨中线 → 放弃分区，退化为 first-fit
+			}
+		}
+	}
+	return []migRegion{{start: 0, end: mid}, {start: mid, end: uint32(sliceCount)}}
+}</code></pre>
+    </div>
+
+    <div class="note tip">
+      <div class="t">分半区的意义：保留大块空间</div>
+      <p style="margin-bottom:0">
+        如果不管三七二十一 first-fit，两个 <code>1g</code> 请求会落在 slot 0 和 slot 1，
+        剩下 slot 2-7 看起来还有 6 个空位，但 <code>4g</code>（占 4 个）
+        只能放在 slot 0 或 slot 4。而 slot 4-7 恰好还是空的，能放。
+        <br>但如果两个 <code>1g</code> 落在 slot 0 和 slot 4，<strong>两个半区都被污染了</strong>，
+        <code>4g</code> 就再也放不下。
+        <br>打分的目标就是「尽量把小块挤在同一半区，保留另一半完整」。
+      </p>
+    </div>
+
+    <div class="codeblock" data-file="pkg/device/nvidia/mig_topology.go" data-start="184" data-lang="go" data-hl="2-5,7-9,10-12,13-15,16-20">
+<pre><code>func (l migLayout) score(occupied []device.MigPlacement, candidate device.MigPlacement) migPlacementScore {
+	after := make([]device.MigPlacement, 0, len(occupied)+1)
+	after = append(after, occupied...)
+	after = append(after, candidate)
+	score := migPlacementScore{start: candidate.Start}
+	for i, region := range l.regions {
+		if region.free(after) {
+			score.emptyRegions++              // ① 放完之后还有几个半区是完全空的 —— 越多越好
+		}
+		if len(l.regions) &lt; 2 || !region.contains(candidate) {
+			continue
+		}
+		if (candidate.Size == region.size()) != (i == l.reserved) {
+			score.zoneMismatch = 1            // ② 大块该去「保留区」，小块该去另一区
+		}
+		if i == 0 {
+			score.edgeDistance = region.end - (candidate.Start + candidate.Size)
+		} else {
+			score.edgeDistance = candidate.Start - region.start
+		}                                     // ③ 越靠半区边缘越好（往两边挤，中间留连续空间）
+	}
+	return score
+}</code></pre>
+    </div>
+
+    <h3>2.2 贪心不够，需要回溯</h3>
+
+    <div class="codeblock" data-file="pkg/device/nvidia/mig_topology.go" data-start="233" data-lang="go" data-hl="1-11">
+<pre><code>// place assigns every requested profile without overlap. result[i] belongs to
+// requested[i]. Requests are placed pickiest first, best-scored placement
+// first; when that greedy path succeeds the result is exactly the greedy
+// result. When it fails although fits allowed the request, the same ranked
+// candidates are searched by backtracking, so the greedy choice filling the
+// wrong half first does not by itself reject the request. Every level checks
+// fits for the requests still unplaced, so a run of identical requests that
+// can no longer fit is rejected once rather than in every order. The search
+// tries at most migSearchBudget candidates in total and rejects the request
+// once the budget is spent; on the supported placement tables the exhaustive
+// search never comes near it.
+func (l migLayout) place(occupied []device.MigPlacement, requested []device.MigProfile) ([]device.MigPlacement, bool) {</code></pre>
+    </div>
+
+    <div class="note">
+      <div class="t">这段注释交代了四个设计决策</div>
+      <ul style="margin-bottom:0">
+        <li>「pickiest first」：先放选择最少的请求（大块 placement 少），
+            这是约束满足问题的标准启发式（最受约束变量优先）。</li>
+        <li>「greedy path succeeds → 结果就是贪心结果」：
+            保证常见情况下行为可预测，不会因为加了回溯就变得难以理解。</li>
+        <li>「every level checks fits」：剪枝。
+            每一层先用 <code>fits()</code> 快速判断剩下的还能不能放下，
+            不能就整个分支砍掉，而不是一个个排列试。</li>
+        <li>「migSearchBudget = 4096」：给搜索加了硬预算。
+            宁可拒绝一个理论上可行的请求，也不能让调度器卡死。
+            后面还加了一句「实际的 placement 表根本用不到这个上限」——
+            说明作者做过量化评估。</li>
+      </ul>
+    </div>
+
+    <div class="note trap">
+      <div class="t">回到第 05 章那个诡异的 <code>i++</code></div>
+      <div class="codeblock" data-file="pkg/device/nvidia/device.go" data-start="985" data-lang="go" data-hl="1-3">
+<pre><code>		if dev.Mode == "mig" {
+			i++                    // 配合 for i--，效果是「原地不动，重新检查同一张卡」
+		}
+	}</code></pre>
+      </div>
+      <p style="margin-bottom:0">
+        现在能解释了：一张 MIG 卡上<strong>可以切出多个实例</strong>，
+        一个容器申请 2 张「卡」时，这 2 张<strong>可能都在同一张物理卡上</strong>
+        （比如两个 <code>2g.10gb</code> 实例）。
+        <br>所以 Fit 遍历到 MIG 卡时不能只看一次就走 —— 要停在原地反复检查，
+        直到这张卡再也放不下为止。
+      </p>
+    </div>
+
+    <h3>2.3 MIG 的分配为什么在 AddResourceUsage 里</h3>
+
+    <div class="codeblock" data-file="pkg/device/nvidia/device.go" data-start="779" data-lang="go" data-hl="2-4,5-8,9-11,12-13,14-17,18">
+<pre><code>func (dev *NvidiaGPUDevices) AddResourceUsage(pod *corev1.Pod, n *device.DeviceUsage, ctr *device.ContainerDevice) error {
+	if n.Mode == MigMode {
+		occupied := occupiedMigPlacements(n.MigAllocationsInUse)
+		profile, placement, ok := plannedMigAllocation(n.MigProfiles, occupied, ctr)
+		if !ok {
+			profile, placement, ok = selectMigCandidate(n.MigProfiles, occupied, ctr.Usedmem)
+		}
+		if !ok {
+			return errors.New("MIG profile and placement allocation failed")
+		}
+		ctr.Usedmem = profile.MemoryMB          // 覆盖用户请求值！
+		ctr.Usedcores = profile.Core            // 
+		if ctr.CustomInfo == nil {
+			ctr.CustomInfo = make(map[string]any)
+		}
+		ctr.CustomInfo[MigProfileCustomInfo] = profile.Name
+		ctr.CustomInfo[MigPlacementCustomInfo] = placement
+		n.MigAllocationsInUse = append(n.MigAllocationsInUse, device.MigAllocation{Profile: profile.Name, Placement: placement})
+	}
+	n.Used++
+	n.Usedcores += ctr.Usedcores
+	n.Usedmem += ctr.Usedmem
+	return nil
+}</code></pre>
+    </div>
+
+    <div class="note warn">
+      <div class="t">MIG 模式下，用户的请求值会被向上取整到 profile 规格</div>
+      <p style="margin-bottom:0">
+        用户申请 <code>gpumem: 6000</code>，但 A100 的 MIG profile 只有
+        5GB / 10GB / 20GB / 40GB 几档。HAMi 会选 <code>2g.10gb</code>，
+        然后把 <code>ctr.Usedmem</code> 改成 10240。
+        <br>所以 Pod 注解里最终记的是 10240 而不是 6000。用户实际拿到的比申请的多，但配额也按 10240 扣。
+        <br>这个「静默向上取整」如果不知道，排查配额问题时会很困惑。
+      </p>
+    </div>
+
+    <h2>3. NVLink 拓扑感知</h2>
+
+    <div class="note analogy">
+      <div class="t">链路类型决定分数</div>
+      <p style="margin-bottom:0">
+        多卡训练时，GPU 之间要频繁交换梯度。它们之间的「路」有多宽，直接决定训练速度。
+      </p>
+      <div class="tbl-wrap" style="margin-bottom:0">
+      <table>
+        <tr><th style="width:200px">连接方式</th><th style="width:80px">分数</th><th>相当于</th></tr>
+        <tr><td><code>P2PLinkCrossCPU</code></td><td>10</td><td>在不同楼层，走楼梯</td></tr>
+        <tr><td><code>P2PLinkSameCPU</code></td><td>20</td><td>同楼层不同房间</td></tr>
+        <tr><td><code>P2PLinkHostBridge</code></td><td>30</td><td>同房间隔着走廊</td></tr>
+        <tr><td><code>P2PLinkMultiSwitch</code></td><td>40</td><td>相邻工位，中间隔两个人</td></tr>
+        <tr><td><code>P2PLinkSingleSwitch</code></td><td>50</td><td>相邻工位，隔一个人</td></tr>
+        <tr><td><code>P2PLinkSameBoard</code></td><td>60</td><td>面对面坐</td></tr>
+        <tr><td><code>SingleNVLINKLink</code></td><td><b>100</b></td><td>专线电话（NVLink 起步就碾压 PCIe）</td></tr>
+        <tr><td><code>TwoNVLINKLinks</code></td><td>200</td><td>两条专线</td></tr>
+        <tr><td>…每多一条 +100</td><td>…</td><td>H100/B200 最多 18 条 = 1800 分</td></tr>
+      </table>
+      </div>
+    </div>
+
+    <div class="codeblock" data-file="pkg/device/nvidia/calculate_score.go" data-start="211" data-lang="go" data-hl="9-18,20,22-33">
+<pre><code>func calculateGPUPairScore(gpu0 *Device, gpu1 *Device) (int, bool) {
+	if gpu0 == nil || gpu1 == nil {
+		return 0, false
+	}
+	if gpu0 == gpu1 {
+		return 0, false
+	}
+
+	if len(gpu0.Links[gpu1.Index]) != len(gpu1.Links[gpu0.Index]) {
+		klog.Warningf("asymmetric P2P link data for GPU pair (index=%d uuid=%s) &lt;-&gt; (index=%d uuid=%s): "+
+			"%d link(s) from GPU %d to GPU %d, %d link(s) from GPU %d to GPU %d; "+
+			"scoring pair as 0 (possible NVLink hardware or driver issue)",
+			gpu0.Index, gpu0.UUID, gpu1.Index, gpu1.UUID,
+			len(gpu0.Links[gpu1.Index]), gpu0.Index, gpu1.Index,
+			len(gpu1.Links[gpu0.Index]), gpu1.Index, gpu0.Index)
+		return 0, true                        // 双向链路数不一致 → 判 0 分并告警
+	}
+
+	score := 0
+
+	for _, link := range gpu0.Links[gpu1.Index] {
+		switch link.Type {
+		case P2PLinkCrossCPU:
+			score += 10
+		case P2PLinkSameCPU:
+			score += 20
+		case P2PLinkHostBridge:
+			score += 30
+		case P2PLinkMultiSwitch:
+			score += 40
+		case P2PLinkSingleSwitch:
+			score += 50
+		case P2PLinkSameBoard:
+			score += 60
+		case SingleNVLINKLink:
+			score += 100
+		...
+		}
+	}
+	...
+}</code></pre>
+    </div>
+
+    <div class="note tip">
+      <div class="t">「链路数不对称」的检测</div>
+      <p style="margin-bottom:0">
+        A→B 报告 4 条 NVLink，B→A 只报告 2 条 —— 这在物理上不可能，
+        说明<strong>硬件故障或驱动状态异常</strong>。
+        代码不是无视它，而是判 0 分 + 打日志 + 上报 Node Warning Event
+        （第 08 章的 <code>AsymmetricGPUP2PLink</code>）。
+        <br>这里的处理方式是：数据自相矛盾时，宁可保守处理并大声告警，
+        也不要猜一个值继续跑。
+      </p>
+    </div>
+
+    <div class="lab">
+      <header>NVLink 拓扑选卡模拟器<span class="badge">互动</span></header>
+      <div class="body">
+        <p style="font-size:13.5px;color:var(--fg-soft);margin-bottom:12px">
+          一台 8 卡机，卡之间连接方式不同。申请 N 张卡，看
+          <code>topology-aware</code> 策略怎么挑出「互联最好的组合」。
+        </p>
+        <div class="field-row">
+          <div><label class="f">要几张卡</label><input type="number" id="tp_n" value="2" min="1" max="4"></div>
+          <div style="flex:1 1 190px"><label class="f">机型</label>
+            <select id="tp_model">
+              <option value="dgx">DGX A100（NVSwitch 全互联 + 2 个 NUMA）</option>
+              <option value="pcie">PCIe 机型（0-1、2-3 有 NVLink 桥接）</option>
+            </select>
+          </div>
+        </div>
+        <div class="out" id="tp_out"></div>
+      </div>
+    </div>
+
+    <h3>3.1 拓扑策略怎么接进 Fit</h3>
+
+    <p>回顾第 05 章 <code>Fit()</code> 里的 <code>needTopology</code>：</p>
+
+    <div class="codeblock" data-file="pkg/device/nvidia/device.go" data-start="989" data-lang="go" data-hl="1,2-6,7-9,10-14,15-20">
+<pre><code>	if needTopology {
+		if len(tmpDevs[k.Type]) == int(originReq) {
+			klog.V(5).InfoS("device allocate success", "pod", klog.KObj(pod), "allocate device", tmpDevs)
+			recordMigPlans(devices, tmpDevs[k.Type])
+			return true, tmpDevs, ""              // 候选数刚好 = 需求数，没得选
+		}
+		if len(tmpDevs[k.Type]) &gt; int(originReq) {
+			// A MIG card appears once per free slot; duplicates only inflate the
+			// combination space and win zero-score ties. Collapse when cards suffice.
+			candidates := tmpDevs
+			if distinct := distinctCardCandidates(tmpDevs[k.Type]); len(distinct) &gt;= int(originReq) {
+				candidates = map[string]device.ContainerDevices{k.Type: distinct}
+			}
+			if originReq == 1 {
+				// If requesting a device, select the card with the worst connection to other cards (lowest total score).
+				lowestDevices := computeWorstSingleCard(nodeInfo, request, candidates)
+				tmpDevs[k.Type] = lowestDevices
+				klog.V(5).InfoS("device allocate success", "pod", klog.KObj(pod), "worst device", lowestDevices)
+			} else {
+				// If requesting multiple devices, select the best combination of cards.
+				combinations := generateCombinations(request, candidates)
+				combination := computeBestCombination(nodeInfo, combinations)
+				tmpDevs[k.Type] = combination
+			}
+			...
+		}
+	}</code></pre>
+    </div>
+
+    <div class="note">
+      <div class="t">单卡请求要挑<b>互联最差</b>的那张 —— 这不是笔误</div>
+      <p style="margin-bottom:0">
+        <code>computeWorstSingleCard</code>：只要 1 张卡时，
+        <strong>故意挑跟其他卡连接最差的那张</strong>。
+        <br>为什么？因为这张卡的高速互联对单卡任务<strong>毫无价值</strong>，
+        但把它留着，后面来的多卡任务就能用上完整的 NVLink 组。
+        <br>这是<strong>「资源碎片管理」的经典思路</strong>：
+        把「不需要某种特质」的任务，安排到「缺少那种特质」的资源上。
+        <br>注意 <code>needTopology</code> 时 <code>k.Nums--</code> 被跳过了 ——
+        因为要先<strong>收集所有可用候选</strong>，最后再从中挑最优组合，
+        而不是遇到一张收一张。
+      </p>
+    </div>
+
+    <h2>4. NUMA 回填（refit）：设备插件反向调用调度器</h2>
+
+    <div class="note trap">
+      <div class="t">问题：kubelet 的 Topology Manager 会推翻调度器的决定</div>
+      <p>
+        调度器在<strong>集群层面</strong>选了 GPU-3。
+        但 kubelet 上还有一个 Topology Manager，
+        它会为了 CPU/内存/GPU 的 NUMA 亲和性，
+        把可用设备集合缩小到某几个 NUMA 节点上的设备。
+      </p>
+      <p style="margin-bottom:0">
+        如果 GPU-3 不在那个集合里 —— 调度器选的卡，kubelet 不让用。
+        <br>老办法是直接失败，Pod 重新调度，但下次调度器可能还是选 GPU-3，
+        <strong>死循环</strong>。这就是 issue #2080。
+      </p>
+    </div>
+
+    <div class="flow">
+      <div class="node">
+        <div class="h">① 调度器选了 GPU-3<span class="tag">集群视角</span></div>
+        <div class="d">写进 <code>hami.io/vgpu-devices-to-allocate</code></div>
+      </div>
+      <div class="arrow">↓</div>
+      <div class="node">
+        <div class="h">② kubelet Topology Manager 限制<span class="tag">节点视角</span></div>
+        <div class="d">为了 NUMA 对齐，可用设备集合只剩 GPU-0、GPU-1 的副本</div>
+      </div>
+      <div class="arrow">↓ <span class="lbl">设备插件在 GetPreferredAllocation 里发现对不上</span></div>
+      <div class="node">
+        <div class="h">③ 设备插件 POST /refit<span class="tag">反向调用</span></div>
+        <div class="d">「调度器，我这边只能用 [GPU-0, GPU-1]，你重新挑一个」</div>
+        <div class="src"><span data-srcref="pkg/device-plugin/nvidiadevice/nvinternal/plugin/numa_refit_client.go"></span></div>
+      </div>
+      <div class="arrow">↓</div>
+      <div class="node">
+        <div class="h">④ 调度器 RefitNumaAllocation<span class="tag">重新决策</span></div>
+        <div class="d">在受限集合里<b>重跑一遍完整的 Fit</b> → 改两条注解 → 更新内存账本</div>
+        <div class="src"><span data-srcref="pkg/scheduler/numa_refit_handler.go:71"></span></div>
+      </div>
+    </div>
+
+    <div class="codeblock" data-file="pkg/device/numa_refit.go" data-start="19" data-lang="go" data-hl="1-7,9-10,13-17,19-22,24-26,28-30">
+<pre><code>// NumaRefitRequest asks the scheduler to re-run its normal fit for one
+// container of an already-bound Pod, restricted to the physical devices whose
+// replicas kubelet's Topology Manager left in the allocation's available set.
+// The device plugin sends it when the scheduler-annotated device has no
+// replica in that set. See the NUMA alignment design discussion in issue
+// Project-HAMi/HAMi#2080.
+type NumaRefitRequest struct {
+	// PodUID guards against reusing a stale Pod object of the same name.
+	PodUID       string `json:"podUID"`
+	PodNamespace string `json:"podNamespace"`
+	PodName      string `json:"podName"`
+	NodeName     string `json:"nodeName"`
+	// ContainerIndex is the Pod container position the refit applies to,
+	// counting init containers first, matching PodDevices ordering. Senders
+	// must derive it from the Pod's current to-allocate annotation state,
+	// not from kubelet request positions, which shift as annotation entries
+	// are consumed during allocation.
+	ContainerIndex int `json:"containerIndex"`
+	// ContainerName optionally names the container at ContainerIndex so the
+	// scheduler can cross-check the index against the Pod spec and refuse a
+	// mismatched request.
+	ContainerName string `json:"containerName,omitempty"`
+	// DeviceType is the device vendor type the refit applies to. The scheduler
+	// currently accepts "NVIDIA" only; other registered types are rejected
+	// until their allocation-specific accounting is supported.
+	DeviceType string `json:"deviceType"`
+	// AllowedDeviceUUIDs lists the physical device IDs kubelet can still
+	// satisfy the allocation from. The refit must select among these only.
+	AllowedDeviceUUIDs []string `json:"allowedDeviceUUIDs"`
+}</code></pre>
+    </div>
+
+    <div class="note tip">
+      <div class="t">三个防御性设计，都写在注释里了</div>
+      <ol style="margin-bottom:0">
+        <li><b><code>PodUID</code> 防陈旧对象</b>：同名 Pod 可能是重建的新 Pod，
+            只靠名字会张冠李戴。</li>
+        <li><code>ContainerIndex</code> 必须从注解推导，不能用 kubelet 的请求序号：
+            因为注解条目在分配过程中会被逐个消费掉（第 08 章的「消费即擦除」），
+            两边的序号会漂移。</li>
+        <li><code>ContainerName</code> 做交叉校验：多给一个冗余字段，
+            让调度器能验证 index 对不对。协议里加冗余字段做一致性检查，
+            比事后排查串台问题便宜得多。</li>
+      </ol>
+    </div>
+
+    <div class="codeblock" data-file="pkg/scheduler/numa_refit_handler.go" data-start="71" data-lang="go" data-hl="1-5,7-11">
+<pre><code>// RefitNumaAllocation moves one container's device reservation onto a device
+// from the caller-supplied allowed set, re-running the pod's normal
+// policy-chain fit restricted to that set. The device plugin calls it (via
+// the /refit route) when kubelet's Topology Manager restricted an allocation
+// to replicas of devices the scheduler did not annotate; see issue #2080.
+//
+// The scheduler stays authoritative: the refit runs the same fit and
+// capacity checks as scheduling, patches hami.io/vgpu-devices-to-allocate
+// and hami.io/vgpu-devices-allocated together in one merge patch, and only
+// then moves the in-memory reservation. Failures are reported in-band and
+// leave both annotations and accounting untouched.</code></pre>
+    </div>
+
+    <div class="note">
+      <div class="t">「调度器保持权威」是这个设计的核心原则</div>
+      <p style="margin-bottom:0">
+        设备插件<strong>不能自己改分配</strong>，只能<strong>请求</strong>调度器改。
+        因为只有调度器持有完整的集群账本，能做容量校验。
+        <br>而且改动是<strong>原子的</strong>：两条注解在同一个 merge patch 里改，
+        改成功之后才动内存账本；<strong>失败则两边都不动</strong>。
+        <br>再加上 <code>allocLock</code>（第 07 章）保证不跟 Filter 交错 ——
+        这是一套完整的「跨进程事务」设计。
+      </p>
+    </div>
+
+    <div class="codeblock" data-file="pkg/scheduler/numa_refit_handler.go" data-start="38" data-lang="go" data-hl="1-5,7-11">
+<pre><code>// patchPodAnnotations patches only the given annotations, with the pod's
+// resourceVersion as a precondition so a stale refit cannot overwrite a
+// newer update to the same annotations (for example Allocate consuming a
+// to-allocate entry). Conflicts fail the refit; there is no retry with
+// cached values. Also a test seam.
+...
+// refitPatchTimeout bounds the annotation patch. It is deliberately no longer
+// than the device plugin's own refit budget: a patch that has not landed by
+// then cannot be used, and waiting longer would hold the allocation lock
+// against every concurrent Filter call.</code></pre>
+    </div>
+
+    <div class="note warn">
+      <div class="t">「冲突就失败，不重试」是刻意的</div>
+      <p style="margin-bottom:0">
+        一般 patch 冲突都会重试。但这里<strong>明确不重试</strong>。因为冲突意味着「有人（比如 Allocate）已经动过这个注解了」，
+        基于旧快照重算出来的结果已经不对了，重试只会覆盖掉正确的状态。
+        <br>同理，超时也刻意设得<strong>不超过设备插件那边的预算</strong>：
+        超过了对方也用不上，而 refit 期间是<strong>持着 allocLock 的</strong>，
+        拖着不放会阻塞所有并发的 Filter。
+        <br>这两个决策都体现了「持锁期间要尽快做完或尽快放弃」的原则。
+      </p>
+    </div>
+
+    <h2>5. 动手实验</h2>
+
+    <ol class="steps">
+      <li>
+        <span class="st">跑 MIG 拓扑测试（812 行用例，覆盖各种装箱场景）</span>
+        <div class="codeblock" data-lang="bash"><pre><code>go test ./pkg/device/nvidia/ -run "TestMig" -v -count=1 2>&amp;1 | head -40
+grep -n "^func Test" pkg/device/nvidia/mig_topology_test.go</code></pre></div>
+      </li>
+      <li>
+        <span class="st">验证「贪心失败 → 回溯成功」的用例</span>
+        <div class="codeblock" data-lang="bash"><pre><code>grep -n "backtrack\|greedy" pkg/device/nvidia/mig_topology_test.go
+go test ./pkg/device/nvidia/ -run "TestMigPlace|TestPlace" -v -count=1</code></pre></div>
+      </li>
+      <li>
+        <span class="st">跑 NVLink 拓扑测试</span>
+        <div class="codeblock" data-lang="bash"><pre><code>go test ./pkg/device/nvidia/ -run "TestCalculateGPU|Test.*Score" -v -count=1
+go test ./pkg/scheduler/ -run "Test_Nvidia_GPU_Topology" -v -count=1   # score_test.go:4269</code></pre></div>
+      </li>
+      <li>
+        <span class="st">跑 NUMA refit 的测试</span>
+        <div class="codeblock" data-lang="bash"><pre><code>go test ./pkg/scheduler/ -run "NumaRefit|Refit" -v -count=1
+wc -l pkg/scheduler/numa_refit_handler_test.go     # 1029 行，说明这块很复杂</code></pre></div>
+      </li>
+      <li>
+        <span class="st">读设计文档（这三块都有专门的文档）</span>
+        <div class="codeblock" data-lang="bash"><pre><code>cat docs/develop/mig-dynamic-deallocate.md      # 当前的 MIG 设计
+cat docs/develop/dynamic-mig-migration.md       # 从旧实现迁移的操作指南
+cat docs/develop/dynamic-mig.md                 # 旧设计（已标注 Legacy）</code></pre></div>
+      </li>
+      <li>
+        <span class="st">看 MIG 的端到端测试脚本</span>
+        <div class="codeblock" data-lang="bash"><pre><code>cat hack/e2e-mig-smoke-test.sh | head -40
+cat hack/hami-mig-e2e.sh | head -30</code></pre></div>
+      </li>
+    </ol>
+
+    <h2>6. 本章自测</h2>
+
+    <div class="quiz" data-answer="C">
+      <div class="q">用户申请 <code>nvidia.com/gpumem: 6000</code>，调度到一张 MIG 模式的 A100 上。Pod 注解里最终记录的显存是多少？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>6000，跟申请的一样</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>0，MIG 模式不记显存</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>被向上取整到匹配的 MIG profile 规格，比如 <code>2g.10gb</code> 的 10240</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>调度失败，因为 6000 不是合法的 MIG 规格</span></div>
+      <div class="expl">
+        看 <code>AddResourceUsage</code>（<code>device.go:779</code>）：
+        MIG 模式下选中 profile 后，<strong>直接覆写</strong>
+        <code>ctr.Usedmem = profile.MemoryMB</code> 和 <code>ctr.Usedcores = profile.Core</code>。
+        <br>MIG 是固定规格的硬件切分，没有「6000MB」这种档位，只能向上取整。
+        <br>副作用：配额也按取整后的值扣。
+        用户看到「我只申请了 6000，为什么扣了 10240 配额」时，答案就在这里。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="B">
+      <div class="q">A100 有 8 个 MIG slice。已经放了两个 <code>1g</code>，分别在 slot 0 和 slot 4。现在申请一个 <code>3g.20gb</code>（占 4 个 slice，允许起始位置 0 和 4）。结果是？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>放在 slot 0-3</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>放不下 —— 两个半区都被污染了</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>放在 slot 2-5</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>先驱逐一个 1g 实例再放</span></div>
+      <div class="expl">
+        <code>3g</code> 只能从 slot 0 或 slot 4 开始（占 4 个），
+        但 slot 0 和 slot 4 各被一个 <code>1g</code> 占了 → 两个候选位置都冲突。
+        <br>这正是 <code>migRegions</code> 半区打分要避免的情况：
+        如果两个 <code>1g</code> 都被挤到同一半区（比如 slot 0 和 slot 1），
+        另一半 slot 4-7 完整保留，<code>3g</code> 就放得下。
+        <br>上面的模拟器可以亲手复现这个场景 —— 对比「贪心评分」和「朴素 first-fit」的差别。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="D">
+      <div class="q"><code>topology-aware</code> 策略下，只申请 <strong>1 张</strong>卡时，HAMi 会挑哪张？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>NVLink 连接最好的那张</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>索引最小的那张</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>随机一张</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>跟其他卡连接<b>最差</b>的那张</span></div>
+      <div class="expl">
+        看 <code>computeWorstSingleCard</code> 和它上面那行注释：
+        <em>「select the card with the worst connection to other cards」</em>。
+        <br>逻辑是：单卡任务用不上 NVLink，把互联好的卡留给后面的多卡任务。
+        这是资源碎片管理的经典思路 —— 让「不挑食」的任务去吃「不好的」资源。
+        <br>多卡请求才用 <code>computeBestCombination</code> 挑互联最好的组合。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="A">
+      <div class="q">NUMA refit 的 patch 遇到 resourceVersion 冲突时，为什么<strong>不重试</strong>？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>冲突说明有人（如 Allocate）已经改过注解，基于旧快照算出的结果已经不对，重试会覆盖正确状态</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>重试会导致死锁</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>K8s 不支持对注解重试 patch</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>为了减少 apiserver 压力</span></div>
+      <div class="expl">
+        注释写得很清楚：
+        <em>「a stale refit cannot overwrite a newer update to the same annotations
+        (for example Allocate consuming a to-allocate entry). Conflicts fail the refit;
+        there is no retry with cached values.」</em>
+        <br>refit 的整个决策是基于「读到注解那一刻」的快照做的。
+        如果注解变了，那个快照就失效了 —— 重试等于用过时的决策覆盖新状态。
+        <br>正确做法是整个 refit 失败，让上层重新走一遍。
+        B 也有一点道理（refit 持着 allocLock），但不是主要原因。
+      </div>
+    </div>
+
+    <h2>7. 小结</h2>
+
+    <ul>
+      <li>MIG 是硬件隔离，hami-core 是用户态限制；前者规格固定、强隔离，后者灵活、可超卖。</li>
+      <li>MIG 分配是<b>受约束的区间装箱</b>：半区打分（保留大块）+ 最受约束优先 + 回溯 + 搜索预算封顶。</li>
+      <li>MIG 会把用户请求向上取整到 profile 规格并覆写 <code>Usedmem</code>，配额也按取整值扣。</li>
+      <li>NVLink pair score：PCIe 类 10-60 分，NVLink 起步 100 分，每多一条 +100。
+          双向链路数不一致时<b>判 0 分并告警</b>。</li>
+      <li>拓扑策略下：多卡挑<b>最优组合</b>，<b>单卡故意挑互联最差的那张</b>（留好卡给多卡任务）。</li>
+      <li>NUMA refit 是<b>设备插件反向调用调度器</b>；调度器保持权威，两条注解原子改，
+          <b>冲突即失败不重试</b>，超时不超过对方预算。</li>
+    </ul>
+
+    <p class="next-hint">源码部分到此结束。最后一章讲<strong>怎么把这些知识变成社区贡献</strong>：
+        本地跑通全部 CI 检查、找到适合自己的 issue、写出会被合入的 PR。
+        <br>本章沿途标记的那些 <code>FIXME</code> / <code>TODO</code> / 被注释掉的代码，
+        都会在那里汇总成一张<strong>可以直接下手的清单</strong>。</p>
+
+    <div class="chapter-nav" id="chapterNav"></div>
+  </main>
+</div>
+
+<script src="../assets/js/site.js"></script>
+<script>
+/* ========== 实验室 1：MIG 装箱模拟器 ========== */
+(function () {
+  const SLICES = 8;
+  // A100 的真实 placement 表（简化）：size → 允许的起始位置
+  const PLACEMENTS = { 1: [0,1,2,3,4,5,6,7], 2: [0,2,4,6], 4: [0,4], 8: [0] };
+  const NAMES = { 1: '1g.5gb', 2: '2g.10gb', 4: '3g.20gb', 8: '7g.40gb' };
+  let occupied = [];   // [{start,size,name}]
+  const board = document.getElementById('mig_board');
+  const out = document.getElementById('mig_out');
+
+  const conflicts = (s, sz) => occupied.some(o => s < o.start + o.size && o.start < s + sz);
+
+  function regions() {
+    // 复刻 migRegions：检查有没有 placement 跨中线
+    const mid = Math.ceil(SLICES / 2);
+    for (const sz in PLACEMENTS) {
+      const n = +sz;
+      if (n === 0 || n >= SLICES) continue;
+      for (const st of PLACEMENTS[sz]) {
+        if (st < mid && st + n > mid) return [{ start: 0, end: SLICES }];
+      }
+    }
+    return [{ start: 0, end: mid }, { start: mid, end: SLICES }];
+  }
+
+  function score(start, size) {
+    // 复刻 migLayout.score 的 emptyRegions + edgeDistance
+    const regs = regions();
+    const after = occupied.concat([{ start, size }]);
+    let empty = 0, edge = 0;
+    regs.forEach((r, i) => {
+      const free = !after.some(o => r.start < o.start + o.size && o.start < r.end);
+      if (free) empty++;
+      if (regs.length >= 2 && start >= r.start && start + size <= r.end) {
+        edge = i === 0 ? r.end - (start + size) : start - r.start;
+      }
+    });
+    return { empty, edge, start };
+  }
+
+  function place(size, greedy) {
+    const cands = (PLACEMENTS[size] || []).filter(s => s + size <= SLICES && !conflicts(s, size));
+    if (cands.length === 0) return null;
+    if (!greedy) return cands[0];                       // first-fit
+    // 贪心：emptyRegions 多优先，edgeDistance 小优先
+    let best = cands[0], bs = score(best, size);
+    for (const c of cands.slice(1)) {
+      const s = score(c, size);
+      if (s.empty > bs.empty || (s.empty === bs.empty && s.edge < bs.edge)) { best = c; bs = s; }
+    }
+    return best;
+  }
+
+  function render(msg) {
+    const mid = Math.ceil(SLICES / 2);
+    let html = '<div style="display:flex;gap:3px;font-family:var(--mono);font-size:11px">';
+    for (let i = 0; i < SLICES; i++) {
+      const o = occupied.find(x => i >= x.start && i < x.start + x.size);
+      const isStart = o && o.start === i;
+      const bg = o ? 'var(--accent)' : 'var(--bg-inset)';
+      const fg = o ? '#fff' : 'var(--fg-mute)';
+      const border = i === mid ? 'border-left:2px dashed var(--rose);' : '';
+      html += `<div style="flex:1;${border}text-align:center;padding:14px 2px;background:${bg};color:${fg};border-radius:4px">
+        ${isStart ? o.name : (o ? '·' : i)}</div>`;
+    }
+    html += '</div><div style="display:flex;gap:3px;margin-top:4px;font-family:var(--mono);font-size:10px;color:var(--fg-mute)">';
+    for (let i = 0; i < SLICES; i++) html += `<div style="flex:1;text-align:center">slot ${i}</div>`;
+    html += '</div>';
+    html += `<div style="font-size:11.5px;color:var(--fg-mute);font-family:var(--mono);margin-top:6px">
+      虚线 = 半区中线（migRegions 把卡分成 [0,${mid}) 和 [${mid},${SLICES})）</div>`;
+    board.innerHTML = html;
+
+    const regs = regions();
+    const freeRegs = regs.filter(r => !occupied.some(o => r.start < o.start + o.size && o.start < r.end));
+    let o2 = `<span class="key">当前占用</span>  ${occupied.length === 0 ? '<span class="dim">（空卡）</span>' : occupied.map(o => `${o.name}@[${o.start},${o.start + o.size})`).join('  ')}\n`;
+    o2 += `<span class="key">完整空闲半区</span>  ${freeRegs.length} / ${regs.length}\n`;
+    o2 += `<span class="key">还能放下</span>  `;
+    o2 += [1,2,4,8].map(sz => {
+      const ok = (PLACEMENTS[sz] || []).some(s => s + sz <= SLICES && !conflicts(s, sz));
+      return `${NAMES[sz]}:${ok ? '<span class="ok">✓</span>' : '<span class="bad">✗</span>'}`;
+    }).join('  ');
+    if (msg) o2 += '\n\n' + msg;
+    out.innerHTML = o2;
+  }
+
+  function add(greedy) {
+    const size = parseInt(document.getElementById('mig_profile').value, 10);
+    const s = place(size, greedy);
+    if (s === null) {
+      const cands = PLACEMENTS[size] || [];
+      render(`<span class="bad">✗ ${NAMES[size]} 放不下</span>
+<span class="dim">   它只能从 slot ${cands.join(' 或 ')} 开始，这些位置全部被占用或会重叠。
+   → Fit 里报 CardMigTopologyInfeasible（第 05 章第 ⑭ 关）</span>`);
+      return;
+    }
+    occupied.push({ start: s, size, name: NAMES[size] });
+    render(`<span class="ok">✓ ${NAMES[size]} 放在 slot [${s}, ${s + size})</span>  <span class="dim">（${greedy ? '贪心评分' : '朴素 first-fit'}）</span>
+<span class="dim">   候选位置：${(PLACEMENTS[size] || []).filter(x => x + size <= SLICES).join(', ')}
+   ${greedy ? '评分优先「放完之后完整空闲半区更多」，其次「更靠半区边缘」' : 'first-fit 直接取第一个可用的，不考虑后续影响'}</span>`);
+  }
+
+  document.getElementById('mig_add').addEventListener('click', () => add(true));
+  document.getElementById('mig_addfirst').addEventListener('click', () => add(false));
+  document.getElementById('mig_reset').addEventListener('click', () => { occupied = []; render('<span class="dim">已重置</span>'); });
+  render();
+})();
+
+/* ========== 实验室 2：NVLink 拓扑选卡 ========== */
+(function () {
+  const out = document.getElementById('tp_out');
+  const MODELS = {
+    dgx: {
+      name: 'DGX A100（NVSwitch 全互联）',
+      numa: [0,0,0,0,1,1,1,1],
+      score: (i, j) => (Math.floor(i/4) === Math.floor(j/4)) ? 1200 : 600,   // 同 NUMA 12 条链路，跨 NUMA 6 条
+      note: '所有卡通过 NVSwitch 互联；同 NUMA 内 12 条 NVLink，跨 NUMA 6 条。',
+    },
+    pcie: {
+      name: 'PCIe 机型（部分卡有 NVLink 桥）',
+      numa: [0,0,0,0,1,1,1,1],
+      score: (i, j) => {
+        const bridged = (a,b) => (a===0&&b===1)||(a===1&&b===0)||(a===2&&b===3)||(a===3&&b===2)||(a===4&&b===5)||(a===5&&b===4)||(a===6&&b===7)||(a===7&&b===6);
+        if (bridged(i,j)) return 200;                                        // 2 条 NVLink
+        return Math.floor(i/4) === Math.floor(j/4) ? 20 : 10;                // 同/跨 CPU
+      },
+      note: '只有 0-1、2-3、4-5、6-7 之间有 NVLink 桥接（2 条链路），其余走 PCIe。',
+    },
+  };
+  function combos(arr, k) {
+    if (k === 1) return arr.map(x => [x]);
+    const res = [];
+    arr.forEach((x, i) => combos(arr.slice(i + 1), k - 1).forEach(c => res.push([x, ...c])));
+    return res;
+  }
+  function run() {
+    const n = Math.max(1, Math.min(4, parseInt(document.getElementById('tp_n').value, 10) || 2));
+    const m = MODELS[document.getElementById('tp_model').value];
+    const gpus = [0,1,2,3,4,5,6,7];
+
+    let html = `<span class="key">${m.name}</span>\n<span class="dim">${m.note}</span>\n\n`;
+    html += `<span class="key">节点注解 hami.io/node-nvidia-score（部分）</span>\n`;
+    [0,1,4].forEach(i => {
+      html += `   GPU-${i} → ` + gpus.filter(j => j !== i).slice(0,4).map(j => `GPU-${j}:${m.score(i,j)}`).join('  ') + ' …\n';
+    });
+
+    if (n === 1) {
+      const totals = gpus.map(i => ({ i, t: gpus.filter(j => j !== i).reduce((s, j) => s + m.score(i, j), 0) }));
+      const worst = totals.reduce((a, b) => a.t <= b.t ? a : b);
+      html += `\n<span class="key">单卡请求 → computeWorstSingleCard</span>\n`;
+      totals.forEach(t => {
+        html += `   GPU-${t.i}  总分 ${String(t.t).padStart(5)}  ${t.i === worst.i ? '<span class="ok">← 选它（互联最差）</span>' : ''}\n`;
+      });
+      html += `\n<span class="dim">故意挑互联最差的那张：单卡任务用不上 NVLink，
+把高互联的卡留给后面的多卡任务。这是资源碎片管理的经典思路。
+（本例中所有卡对称，实际集群里差异会更明显。）</span>`;
+      out.innerHTML = html;
+      return;
+    }
+
+    const all = combos(gpus, n).map(c => {
+      let s = 0;
+      for (let a = 0; a < c.length; a++) for (let b = a + 1; b < c.length; b++) s += m.score(c[a], c[b]);
+      return { c, s };
+    }).sort((x, y) => y.s - x.s);
+
+    html += `\n<span class="key">${n} 卡请求 → generateCombinations + computeBestCombination</span>\n`;
+    html += `   <span class="dim">共 ${all.length} 种组合，按两两 pair score 之和排序</span>\n\n`;
+    all.slice(0, 5).forEach((x, idx) => {
+      const cls = idx === 0 ? 'ok' : 'dim';
+      html += `   <span class="${cls}">[${x.c.map(i => 'GPU-' + i).join(', ')}]  总分 ${String(x.s).padStart(5)}${idx === 0 ? '  ← 选它' : ''}</span>\n`;
+    });
+    html += `   <span class="dim">…</span>\n`;
+    const worstC = all[all.length - 1];
+    html += `   <span class="bad">[${worstC.c.map(i => 'GPU-' + i).join(', ')}]  总分 ${worstC.s}  ← 最差组合</span>\n`;
+    html += `\n<span class="dim">最优和最差的分差 ${all[0].s - worstC.s} —— 对多卡训练的 allreduce 带宽影响巨大。
+注意：Fit 在 needTopology 时<b>不减 k.Nums</b>，先收集所有候选，最后统一挑组合。</span>`;
+    out.innerHTML = html;
+  }
+  ['tp_n','tp_model'].forEach(id => document.getElementById(id).addEventListener('input', run));
+  run();
+})();
+</script>
+</body>
+</html>

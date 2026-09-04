@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · 速查手册 — HAMi 源码导读</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2316181d'/%3E%3Ctext x='16' y='23' font-size='17' font-family='monospace' font-weight='bold' fill='%23fff' text-anchor='middle'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main class="main">
+
+    <div class="page-kicker">第 12 章 · 第四阶段 成为贡献者</div>
+    <h1 class="page-title">速查手册</h1>
+    <p class="page-lede">
+      读码时随手翻的一页。所有链接都指向 commit <code>95530c6</code>。
+    </p>
+
+    <div class="goals">
+      <h3>这一页怎么用</h3>
+      <ul>
+        <li>用下面的搜索框，输入函数名 / 注解 key / 关键词，直接定位到源码</li>
+        <li>把这一页收藏起来，读码卡住时先来这里查</li>
+      </ul>
+    </div>
+
+    <div class="lab">
+      <header>全局搜索<span class="badge">互动</span></header>
+      <div class="body">
+        <input type="text" id="q" placeholder="输入函数名、注解 key、关键词… 例如 Fit / mutex.lock / 打分 / 超卖" autocomplete="off">
+        <div class="out" id="qout" style="max-height:460px;overflow-y:auto">输入点什么试试。</div>
+      </div>
+    </div>
+
+    <h2>1. 一分钟回顾整条链路</h2>
+
+    <div class="codeblock" data-lang="text" data-title="Pod 的一生">
+<pre><code>kubectl apply
+   ↓
+[Webhook]  改 schedulerName → hami-scheduler，补默认值，拦非法请求      第 03 章
+   ↓                                            pkg/scheduler/webhook.go:54
+[Filter]   Resourcereqs → getNodesUsage → calcScore → 选节点 → 写注解    第 04/05 章
+   ↓                                            pkg/scheduler/scheduler.go:1096
+   │  ├─ fitInDevices  给卡打分 → 排序 → 调后端 Fit → AddResourceUsage
+   │  └─ Fit           14 道关卡逐卡筛选          pkg/device/nvidia/device.go:853
+   ↓
+[Bind]     抢节点锁 → bind-phase=allocating → K8s Bind API              第 06 章
+   ↓                                            pkg/scheduler/scheduler.go:1027
+[Allocate] 猜 pending pod → 读注解 → 擦除 → 注入 env → 放锁              第 08 章
+   ↓                     pkg/device-plugin/.../plugin/server.go:852
+[容器启动]  ld.so.preload → libvgpu.so 劫持 CUDA → OOM 检查 + 令牌桶      第 09 章
+                                                libvgpu/src/cuda/memory.c:119</code></pre>
+    </div>
+
+    <h2>2. 注解速查</h2>
+
+    <h3>2.1 Node 注解</h3>
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:260px">Key</th><th style="width:90px">谁写</th><th>值 / 含义</th></tr>
+      <tr><td><code>hami.io/node-nvidia-register</code></td><td>设备插件</td>
+        <td><b>JSON</b>（<code>MarshalNodeDevices</code>）：<br>
+            <code>[{"id","index","count","devmem","devcore","type","numa","mode","migProfiles","health"}]</code><br>
+            每个字段都带 <code>omitempty</code>，<b>零值 key 会整个消失</b><br>
+            <span style="color:var(--fg-mute)">同格式：amd / ascend / biren / kunlun-vdevice / vastai</span></td></tr>
+      <tr><td><code>hami.io/node-hygon-register</code><br><code>hami.io/node-iluvatar-register</code></td><td>设备插件</td>
+        <td><b>逗号串</b>（<code>DecodeNodeDevices</code>）：<br>
+            <code>{UUID},{Count},{Devmem},{Devcore},{Type},{Numa},{Health}[,{Index},{Mode}]</code>，卡间用 <code>:</code><br>
+            接受 7 或 9 字段；<b>Type 里不能有逗号</b>（无转义）</td></tr>
+      <tr><td><code>hami.io/node-handshake</code></td><td>双方</td>
+        <td><code>Requesting_{ts}</code>（调度器点名）/ <code>Reported {ts}</code>（插件答到）。<b>60 秒</b>超时</td></tr>
+      <tr><td><code>hami.io/node-nvidia-score</code></td><td>设备插件</td>
+        <td>卡间 NVLink pair score，JSON。需 <code>ENABLE_TOPOLOGY_SCORE=true</code></td></tr>
+      <tr><td><code>hami.io/mutex.lock</code></td><td>调度器</td>
+        <td>节点锁：<code>{RFC3339时间},{namespace},{podName}</code>。默认 <b>5 分钟</b>超时</td></tr>
+      <tr><td><code>hami.io/device-cordon</code></td><td>运维手动</td>
+        <td>逗号分隔的 UUID，把这些卡排除出新分配（已跑的不受影响）</td></tr>
+    </table>
+    </div>
+
+    <h3>2.2 Pod 注解（调度器写）</h3>
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:290px">Key</th><th>值 / 含义</th></tr>
+      <tr><td><code>hami.io/vgpu-devices-to-allocate</code></td>
+        <td>「工单」：<code>{UUID},{Type},{Usedmem},{Usedcores}:</code>…<code>;</code>…<br>
+            <code>:</code> 分设备，<code>;</code> 分容器。<b>设备插件消费后擦除</b></td></tr>
+      <tr><td><code>hami.io/vgpu-devices-allocated</code></td><td>同上内容，<b>永久留档</b>，调度器账本和监控读它</td></tr>
+      <tr><td><code>hami.io/vgpu-node</code></td><td>选中的节点名</td></tr>
+      <tr><td><code>hami.io/vgpu-time</code></td><td>分配时间戳（Unix 秒）</td></tr>
+      <tr><td><code>hami.io/bind-phase</code></td><td><code>allocating</code> → <code>success</code> / <code>failed</code></td></tr>
+      <tr><td><code>hami.io/bind-time</code></td><td>Bind 开始时间</td></tr>
+    </table>
+    </div>
+
+    <h3>2.3 Pod 注解（用户写，调整行为）</h3>
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:290px">Key</th><th>可选值</th></tr>
+      <tr><td><code>hami.io/node-scheduler-policy</code></td><td><code>binpack</code>（默认，挑最满）/ <code>spread</code>（挑最空）</td></tr>
+      <tr><td><code>hami.io/gpu-scheduler-policy</code></td>
+        <td><code>binpack</code> / <code>spread</code> / <code>topology-aware</code> / <code>mutex</code> / <code>numa</code><br>
+            可逗号串联做排序键链，如 <code>numa,binpack</code>。<br>
+            <code>mutex</code> 和 <code>topology-aware</code> 是<b>过滤器</b>不是排序键</td></tr>
+      <tr><td><code>hami.io/device-scoring-weights</code></td><td>如 <code>slot=1,core=2,memory=3</code>。只作用于<b>卡级</b>打分</td></tr>
+      <tr><td><code>hami.io/numa-alignment</code></td><td>NUMA 对齐模式，非法值在 webhook 就被拒</td></tr>
+      <tr><td><code>nvidia.com/use-gputype</code> / <code>nouse-gputype</code></td><td>按型号白/黑名单</td></tr>
+      <tr><td><code>nvidia.com/use-gpuuuid</code> / <code>nouse-gpuuuid</code></td><td>按 UUID 白/黑名单</td></tr>
+      <tr><td><code>nvidia.com/numa-bind</code></td><td><code>true</code> = 多卡必须同 NUMA</td></tr>
+      <tr><td><code>nvidia.com/vgpu-mode</code></td><td><code>hami-core</code> / <code>mig</code></td></tr>
+    </table>
+    </div>
+
+    <h2>3. 资源名速查</h2>
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:280px">resources.limits</th><th>含义</th><th>默认行为</th></tr>
+      <tr><td><code>nvidia.com/gpu</code></td><td>要几张卡</td><td>只写它 → 补 <code>gpucores: 100</code>（<b>独占整卡</b>）</td></tr>
+      <tr><td><code>nvidia.com/gpumem</code></td><td>显存 MB</td><td>只写它 → 补 <code>gpu: 1</code></td></tr>
+      <tr><td><code>nvidia.com/gpumem-percentage</code></td><td>显存百分比</td><td>未设置的哨兵值是 <b>101</b></td></tr>
+      <tr><td><code>nvidia.com/gpucores</code></td><td>算力 0-100</td><td>0 = 不限制；100 = 独占</td></tr>
+    </table>
+    </div>
+
+    <h2>4. 调度失败原因</h2>
+    <p>
+      格式：<code>{数量}/{总卡数} {原因}</code>，多个用 <code>, </code> 连接。
+      生成/解析在 <span data-srcref="pkg/device/common/common.go:46"></span>。
+    </p>
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:290px">原因</th><th>含义 / 用户该怎么办</th></tr>
+      <tr><td><code>CardNotHealth</code></td><td>卡不健康。查设备插件日志 / <code>nvidia-smi</code></td></tr>
+      <tr><td><code>CardCordoned</code></td><td>被 <code>hami.io/device-cordon</code> 排除了</td></tr>
+      <tr><td><code>CardTypeMismatch</code></td><td>型号不匹配 <code>use-gputype</code></td></tr>
+      <tr><td><code>CardUuidMismatch</code></td><td>UUID 不匹配 <code>use-gpuuuid</code></td></tr>
+      <tr><td><code>NumaNotFit</code></td><td>要求同 NUMA 但凑不够卡数</td></tr>
+      <tr><td><code>CardTimeSlicingExhausted</code></td><td>切分份数用完（<code>Used &gt;= Count</code>）。调大节点的 <code>deviceSplitCount</code></td></tr>
+      <tr><td><code>CardInsufficientMemory</code></td><td><b>最常见</b>。剩余显存不够。降低 <code>gpumem</code> 或等释放</td></tr>
+      <tr><td><code>CardInsufficientCore</code></td><td>剩余算力不够，或 <code>gpucores</code> 超出 0-100</td></tr>
+      <tr><td><code>CardComputeUnitsExhausted</code></td><td>算力已被预定完，不能再放 <code>gpucores: 0</code> 的任务</td></tr>
+      <tr><td><code>ExclusiveDeviceAllocateConflict</code></td><td>要独占（<code>gpucores:100</code> 或 mutex 策略）但卡上有人</td></tr>
+      <tr><td><code>ResourceQuotaNotFit</code></td><td>超命名空间 ResourceQuota</td></tr>
+      <tr><td><code>CardMigTopologyInfeasible</code></td><td>MIG 模式下找不到可用 placement</td></tr>
+      <tr><td><code>CardNotFoundCustomFilterRule</code></td><td>后端自定义规则拒绝</td></tr>
+      <tr><td><code>NodeInsufficientDevice</code></td><td>节点上该类型的卡总数就不够</td></tr>
+      <tr><td><code>AllocatedCardsInsufficientRequest</code></td><td>凑到了一部分卡但不够数</td></tr>
+      <tr><td><code>ModeNotFit</code></td><td>请求的 mode 和卡的 mode 不匹配</td></tr>
+    </table>
+    </div>
+
+    <h2>5. 关键文件索引</h2>
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:330px">文件</th><th style="width:60px">行数</th><th>是什么</th></tr>
+      <tr><td colspan="3" style="background:var(--bg-soft);font-weight:650">核心抽象</td></tr>
+      <tr><td><span data-srcref="pkg/device/devices.go"></span></td><td>774</td><td>Devices 接口 + 全部数据结构 + 注解编解码。第一个该读透的文件</td></tr>
+      <tr><td><span data-srcref="pkg/device/pods.go"></span></td><td>307</td><td>PodManager，调度器的本地账本</td></tr>
+      <tr><td><span data-srcref="pkg/device/common/common.go"></span></td><td>75</td><td>失败原因常量 + GenReason/ParseReason</td></tr>
+      <tr><td><span data-srcref="pkg/util/types.go"></span></td><td>104</td><td>通用注解 key、策略名常量</td></tr>
+      <tr><td colspan="3" style="background:var(--bg-soft);font-weight:650">调度器</td></tr>
+      <tr><td><span data-srcref="pkg/scheduler/scheduler.go"></span></td><td>1245</td><td>Filter / Bind / informer 回调 / register 循环</td></tr>
+      <tr><td><span data-srcref="pkg/scheduler/score.go"></span></td><td>473</td><td><b>打分主流程</b>：calcScore / scoreNode / fitInDevices</td></tr>
+      <tr><td><span data-srcref="pkg/scheduler/policy/gpu_policy.go"></span></td><td>222</td><td>卡级打分 + 排序（binpack/spread/mutex/numa）</td></tr>
+      <tr><td><span data-srcref="pkg/scheduler/policy/node_policy.go"></span></td><td>130</td><td>节点级打分 + OverrideScore</td></tr>
+      <tr><td><span data-srcref="pkg/scheduler/webhook.go"></span></td><td>216</td><td>准入：改 schedulerName、配额检查</td></tr>
+      <tr><td><span data-srcref="pkg/scheduler/routes/route.go"></span></td><td>224</td><td>HTTP 路由：/filter /bind /webhook /refit</td></tr>
+      <tr><td><span data-srcref="pkg/scheduler/config/config.go"></span></td><td>497</td><td>InitDevicesWithConfig：所有后端在这注册</td></tr>
+      <tr><td><span data-srcref="pkg/scheduler/numa_refit_handler.go"></span></td><td>478</td><td>NUMA 回填</td></tr>
+      <tr><td colspan="3" style="background:var(--bg-soft);font-weight:650">设备后端</td></tr>
+      <tr><td><span data-srcref="pkg/device/nvidia/device.go"></span></td><td>1140</td><td><b>NVIDIA 后端</b>，Fit 在 853 行</td></tr>
+      <tr><td><span data-srcref="pkg/device/nvidia/mig_topology.go"></span></td><td>436</td><td>MIG placement 打分 + 贪心/回溯装箱</td></tr>
+      <tr><td><span data-srcref="pkg/device/nvidia/links.go"></span></td><td>329</td><td>NVLink / P2P 链路类型探测</td></tr>
+      <tr><td><span data-srcref="pkg/device/nvidia/calculate_score.go"></span></td><td>286</td><td>卡间 pair score 计算</td></tr>
+      <tr><td><span data-srcref="pkg/device/kunlun/device.go"></span></td><td>245</td><td><b>最简单的后端，入门读它</b></td></tr>
+      <tr><td colspan="3" style="background:var(--bg-soft);font-weight:650">设备插件</td></tr>
+      <tr><td><span data-srcref="pkg/device-plugin/nvidiadevice/nvinternal/plugin/server.go"></span></td><td>1245</td><td>ListAndWatch / GetPreferredAllocation / <b>Allocate</b></td></tr>
+      <tr><td><span data-srcref="pkg/device-plugin/nvidiadevice/nvinternal/plugin/register.go"></span></td><td>361</td><td>NVML 扫描 + 写 Node 注解</td></tr>
+      <tr><td><span data-srcref="pkg/device-plugin/nvidiadevice/nvinternal/plugin/util.go"></span></td><td>455</td><td>popNextContainerDevices / PodAllocationSuccess</td></tr>
+      <tr><td><span data-srcref="pkg/device-plugin/nvidiadevice/nvinternal/plugin/migmgr.go"></span></td><td>556</td><td>MIG 实例（GI/CI）管理</td></tr>
+      <tr><td colspan="3" style="background:var(--bg-soft);font-weight:650">并发 / 工具</td></tr>
+      <tr><td><span data-srcref="pkg/util/nodelock/nodelock.go"></span></td><td>342</td><td><b>节点锁</b>，基于注解的分布式锁</td></tr>
+      <tr><td><span data-srcref="pkg/util/leaderelection/leaderelection.go"></span></td><td>209</td><td>选主</td></tr>
+      <tr><td><span data-srcref="pkg/util/util.go"></span></td><td>471</td><td>GetPendingPod / PatchPodAnnotations 等</td></tr>
+      <tr><td colspan="3" style="background:var(--bg-soft);font-weight:650">HAMi-core（C）</td></tr>
+      <tr><td><span data-srcref="libvgpu/src/cuda/hook.c"></span></td><td>—</td><td>dlsym 劫持、符号版本解析</td></tr>
+      <tr><td><span data-srcref="libvgpu/src/cuda/memory.c"></span></td><td>—</td><td>显存相关 CUDA API 的劫持点</td></tr>
+      <tr><td><span data-srcref="libvgpu/src/allocator/allocator.c"></span></td><td>—</td><td>oom_check / allocate_raw</td></tr>
+      <tr><td><span data-srcref="libvgpu/src/multiprocess/multiprocess_utilization_watcher.c"></span></td><td>—</td><td>算力令牌桶</td></tr>
+      <tr><td><span data-srcref="libvgpu/src/multiprocess/multiprocess_memory_limit.c"></span></td><td>—</td><td>跨进程显存记账 + 环境变量解析</td></tr>
+    </table>
+    </div>
+
+    <h2>6. 测试文件索引（最好的行为文档）</h2>
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:330px">测试文件</th><th style="width:60px">行数</th><th>覆盖什么</th></tr>
+      <tr><td><span data-srcref="pkg/scheduler/score_test.go"></span></td><td>4632</td><td><b>打分全流程</b>，最完整的行为文档</td></tr>
+      <tr><td><span data-srcref="pkg/device/nvidia/device_test.go"></span></td><td>3618</td><td>NVIDIA 后端全部方法，<code>TestDevices_Fit</code> 在 826 行</td></tr>
+      <tr><td><span data-srcref="pkg/scheduler/scheduler_test.go"></span></td><td>3486</td><td>Filter / Bind / informer 回调</td></tr>
+      <tr><td><span data-srcref="pkg/scheduler/webhook_test.go"></span></td><td>1355</td><td>准入的各种拒绝场景</td></tr>
+      <tr><td><span data-srcref="pkg/scheduler/numa_refit_handler_test.go"></span></td><td>1029</td><td>NUMA 回填</td></tr>
+      <tr><td><span data-srcref="pkg/device/nvidia/mig_topology_test.go"></span></td><td>812</td><td>MIG 装箱，含贪心失败→回溯的用例</td></tr>
+      <tr><td><span data-srcref="pkg/scheduler/policy/gpu_policy_test.go"></span></td><td>742</td><td>排序策略</td></tr>
+      <tr><td><span data-srcref="pkg/scheduler/score_bench_test.go"></span></td><td>206</td><td><b>性能 benchmark</b></td></tr>
+      <tr><td><span data-srcref="pkg/scheduler/register_race_test.go"></span></td><td>125</td><td>register 竞态</td></tr>
+    </table>
+    </div>
+
+    <h2>7. 命令速查</h2>
+
+    <div class="codeblock" data-lang="bash" data-title="构建 / 测试">
+<pre><code>make build                     # 三个二进制 → bin/
+make test                      # 单测 + 覆盖率 → _output/coverage/
+make lint                      # golangci-lint v2.13.1
+make tidy                      # go mod tidy
+hack/verify-all.sh             # CI 的 lint job 全套
+
+go test ./pkg/scheduler/ -run Test_calcScore -v -count=1
+go test ./pkg/... -short -race -count=1
+go test ./pkg/scheduler/ -run XXX -bench=. -benchmem
+go test ./pkg/device/nvidia/ -run TestDevices_Fit -count=1 -args -v=5</code></pre>
+    </div>
+
+    <div class="codeblock" data-lang="bash" data-title="定位代码">
+<pre><code>grep -rn ") Fit(" pkg/device/ --include=*.go | grep -v _test    # 所有 Fit 实现
+grep -rn "hami.io/" --include=*.go pkg/ | grep -v _test          # 所有注解 key
+grep -rn "TODO\|FIXME" --include=*.go pkg/ cmd/ | grep -v _test  # 待办清单
+grep -rn "sync.Mutex\|sync.RWMutex\|atomic\." pkg/ --include=*.go | grep -v _test  # 所有锁</code></pre>
+    </div>
+
+    <div class="codeblock" data-lang="bash" data-title="线上排障">
+<pre><code># 节点设备清单
+kubectl get node &lt;node&gt; -o jsonpath='{.metadata.annotations.hami\.io/node-nvidia-register}'
+
+# 节点锁（卡住时先看这个）
+kubectl get node &lt;node&gt; -o jsonpath='{.metadata.annotations.hami\.io/mutex\.lock}'
+kubectl annotate node &lt;node&gt; hami.io/mutex.lock-        # 应急手动解锁
+
+# Pod 的分配决策
+kubectl get pod &lt;pod&gt; -o jsonpath='{.metadata.annotations}' | python -m json.tool
+
+# 为什么调度不上去
+kubectl describe pod &lt;pod&gt; | grep -A 20 Events
+
+# 容器内验证劫持生效
+kubectl exec &lt;pod&gt; -- cat /etc/ld.so.preload
+kubectl exec &lt;pod&gt; -- env | grep CUDA_DEVICE
+
+# 调度器日志（-v=5 最详细）
+kubectl logs -n kube-system deploy/hami-scheduler -c vgpu-scheduler-extender --tail=200</code></pre>
+    </div>
+
+    <h2>8. 关键设计决策一览</h2>
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:210px">决策</th><th>为什么</th><th style="width:70px">章节</th></tr>
+      <tr><td>用注解字符串通信，不用 CRD/gRPC</td><td>零额外部署、天然持久化、组件重启不丢状态</td><td>01</td></tr>
+      <tr><td>Filter 只返回<b>一个</b>节点</td><td>选卡和判可行性是同一件事，选完必须立刻写注解锁定</td><td>04</td></tr>
+      <tr><td>用量是<b>算</b>出来的（静态清单 + Σ Pod）</td><td>不查 GPU 实际占用，用「承诺分配量」，跟 CPU Requests 同理</td><td>04</td></tr>
+      <tr><td>排序升序 + <b>倒序遍历</b></td><td>一个 Less 反转就实现 binpack/spread 两种相反策略</td><td>05</td></tr>
+      <tr><td>节点锁跨越 Bind→Allocate 两个进程</td><td>真正的资源占用在 Allocate 那一刻，提前放锁会超卖</td><td>06/08</td></tr>
+      <tr><td>多厂商加锁 <code>sort</code> 固定顺序</td><td>防 ABBA 死锁</td><td>06</td></tr>
+      <tr><td>两条注解（to-allocate / allocated）</td><td>一条是工单（消费即销毁），一条是账本（永久保留）</td><td>01/08</td></tr>
+      <tr><td>空容器也在注解里占位</td><td>设备插件按<b>容器序号</b>换算，跳过就全部错位</td><td>01/08</td></tr>
+      <tr><td>显存百分比用 <b>101</b> 当哨兵</td><td>0 在 HAMi-core 里意味着「不限制」，绝不能传下去</td><td>02/09</td></tr>
+      <tr><td>InitContainer 用 DeepCopy + peakUsage</td><td>串行执行取峰值；每个单独都要放得下</td><td>05</td></tr>
+      <tr><td><code>synced</code> 放 register 最后一行</td><td>宁可阻塞请求，也不用残缺缓存做决策</td><td>07</td></tr>
+      <tr><td>只有 leader 做 register</td><td>多副本同时写 handshake 会互相覆盖；filter/bind 不受限，所以锁必须是分布式的</td><td>07</td></tr>
+      <tr><td>单卡请求挑<b>互联最差</b>的卡</td><td>把高 NVLink 的卡留给多卡任务，减少碎片</td><td>10</td></tr>
+      <tr><td>refit 冲突<b>不重试</b></td><td>冲突说明快照失效，重试等于用过时决策覆盖新状态</td><td>10</td></tr>
+    </table>
+    </div>
+
+    <h2>9. 术语表</h2>
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:190px">术语</th><th>含义</th></tr>
+      <tr><td><b>vGPU</b></td><td>一张物理卡切出来的一份虚拟卡（显存 + 算力配额）</td></tr>
+      <tr><td><b>Extender</b></td><td>K8s 调度器扩展器。kube-scheduler 通过 HTTP 调用外部服务参与调度</td></tr>
+      <tr><td><b>hami-core</b></td><td>用户态 CUDA 劫持库（<code>libvgpu.so</code>），软性限制</td></tr>
+      <tr><td><b>MIG</b></td><td>Multi-Instance GPU，NVIDIA 的硬件级切分，强隔离</td></tr>
+      <tr><td><b>MPS</b></td><td>Multi-Process Service，NVIDIA 的进程共享方案</td></tr>
+      <tr><td><b>slice</b></td><td>MIG 里的显存/算力最小单元。A100 有 8 个</td></tr>
+      <tr><td><b>placement</b></td><td>MIG 实例在 slice 序列上的落位 <code>{Start, Size}</code></td></tr>
+      <tr><td><b>GI / CI</b></td><td>GPU Instance / Compute Instance，MIG 的两层实例</td></tr>
+      <tr><td><b>binpack</b></td><td>装箱策略：优先填满已用的资源，留出完整空闲</td></tr>
+      <tr><td><b>spread</b></td><td>摊开策略：优先用最空闲的资源，均衡负载</td></tr>
+      <tr><td><b>mutex</b></td><td>互斥策略：只分配完全空闲的卡（独占）</td></tr>
+      <tr><td><b>Count / 切分份数</b></td><td>一张卡最多被几个容器共享，默认 10</td></tr>
+      <tr><td><b>handshake</b></td><td>调度器和设备插件之间的「点名答到」保活机制</td></tr>
+      <tr><td><b>refit</b></td><td>NUMA 回填：kubelet 拒绝调度器选的卡时，请求重新选</td></tr>
+      <tr><td><b>PodGroup</b></td><td>协同调度（Gang Scheduling）里的一批 Pod，要么全成功要么全失败</td></tr>
+      <tr><td><b>墓碑 / tombstone</b></td><td><code>cache.DeletedFinalStateUnknown</code>，informer 断连期间删除事件的包装</td></tr>
+    </table>
+    </div>
+
+    <div class="note">
+      <div class="t">学完了</div>
+      <p style="margin-bottom:0">
+        回<a href="../index.html">首页</a>看看进度条。如果 13 章都勾满了 ——
+        你现在对 HAMi 的理解已经超过绝大多数使用者，
+        去 <a href="https://github.com/Project-HAMi/HAMi/issues" target="_blank" rel="noopener">issue 列表</a>挑一个活干吧。
+      </p>
+    </div>
+
+    <div class="chapter-nav" id="chapterNav"></div>
+  </main>
+</div>
+
+<script src="../assets/js/site.js"></script>
+<script>
+/* ========== 全局搜索 ========== */
+(function () {
+  const IDX = [
+    // 函数
+    { k: 'Fit 逐卡筛选 14 道关卡 选卡', t: 'NvidiaGPUDevices.Fit()', f: 'pkg/device/nvidia/device.go:853', c: '05', d: '全项目最核心的函数。从后往前遍历排好序的卡，逐张过 14 道关卡。' },
+    { k: 'Filter 调度主流程 HTTP', t: 'Scheduler.Filter()', f: 'pkg/scheduler/scheduler.go:1096', c: '04', d: '7 步：判断相关 → 模拟分支 → 清旧账 → 重建用量 → 打分 → 写注解 → 返回唯一节点。' },
+    { k: 'Bind 绑定 抢锁', t: 'Scheduler.Bind()', f: 'pkg/scheduler/scheduler.go:1027', c: '06', d: '抢节点锁 → bind-phase=allocating → K8s Bind API。任一步失败走 fail() 统一回滚。' },
+    { k: 'calcScore 并发打分 goroutine', t: 'calcScoreWithOptions()', f: 'pkg/scheduler/score.go:414', c: '05', d: '每个候选节点起一个 goroutine 并发打分。' },
+    { k: 'scoreNode 单节点打分 DeepCopy', t: 'Scheduler.scoreNode()', f: 'pkg/scheduler/score.go:345', c: '05', d: '一进去就 DeepCopy，这是并发安全的前提。' },
+    { k: 'fitInDevices 单容器 排序 AddResourceUsage', t: 'fitInDevices()', f: 'pkg/scheduler/score.go:86', c: '05', d: '打分 → 排序 → 调后端 Fit → 记账。' },
+    { k: 'ComputeScore 卡级打分 权重', t: 'DeviceListsScore.ComputeScore()', f: 'pkg/scheduler/policy/gpu_policy.go:200', c: '05', d: 'Score = 10 × (w_slot×份数占用率 + w_core×算力占用率 + w_mem×显存占用率)。' },
+    { k: 'Less 排序 binpack spread mutex numa', t: 'DeviceUsageList.Less()', f: 'pkg/scheduler/policy/gpu_policy.go:78', c: '05', d: '决定选卡顺序。配合 Fit 的倒序遍历一起看才能理解。' },
+    { k: 'ComputeDefaultScore 节点打分', t: 'NodeScore.ComputeDefaultScore()', f: 'pkg/scheduler/policy/node_policy.go:110', c: '05', d: '节点基础分。注意它不支持自定义权重（一个可改进点）。' },
+    { k: 'OverrideScore 后端加分 policyNeutralScorer', t: 'NodeScore.OverrideScore()', f: 'pkg/scheduler/policy/node_policy.go:69', c: '05', d: '叠加后端加分，用标记接口统一处理策略适配。权重 10000 保证后端分数压倒基础分。' },
+    { k: 'Handle webhook 准入 schedulerName', t: 'webhook.Handle()', f: 'pkg/scheduler/webhook.go:54', c: '03', d: '改 schedulerName、补默认值、5 种拒绝场景。' },
+    { k: 'MutateAdmission 补默认值 环境变量', t: 'NvidiaGPUDevices.MutateAdmission()', f: 'pkg/device/nvidia/device.go:334', c: '03', d: '校验参数、注入 env、补卡数和独占算力、设置 RuntimeClass。' },
+    { k: 'GenerateResourceRequests 翻译 limits 101', t: 'GenerateResourceRequests()', f: 'pkg/device/nvidia/device.go:528', c: '02', d: '把 resources.limits 翻译成 ContainerDeviceRequest。101 是「未设置」哨兵。' },
+    { k: 'AddResourceUsage 记账 MIG profile', t: 'AddResourceUsage()', f: 'pkg/device/nvidia/device.go:779', c: '05/10', d: 'Used++ / Usedmem+= / Usedcores+=。MIG 模式下还会覆写请求值为 profile 规格。' },
+    { k: 'getNodesUsage 用量重建 缓存', t: 'Scheduler.getNodesUsage()', f: 'pkg/scheduler/scheduler.go:773', c: '04', d: '空白账本 + Σ 所有已调度 Pod 的分配值 = 节点当前用量。' },
+    { k: 'buildNodeUsage 静态转动态', t: 'buildNodeUsage()', f: 'pkg/scheduler/scheduler.go:683', c: '04', d: 'DeviceInfo → DeviceUsage，所有用量字段初始化为 0。' },
+    { k: 'register 巡检 15秒 synced leader', t: 'Scheduler.register()', f: 'pkg/scheduler/scheduler.go:466', c: '07', d: '只有 leader 执行。synced 在最后一行才置 true。' },
+    { k: 'onAddPod informer 回调 terminating 超卖', t: 'Scheduler.onAddPod()', f: 'pkg/scheduler/scheduler.go:141', c: '07', d: '四道判断。terminating 但没缓存过时必须记账，否则超卖。' },
+    { k: 'onUpdatePod 用量收缩 init', t: 'Scheduler.onUpdatePod()', f: 'pkg/scheduler/scheduler.go:183', c: '07', d: 'InitContainer 跑完后把多预留的显存收缩掉。' },
+    { k: 'onDelNode 墓碑 五连清理', t: 'Scheduler.onDelNode()', f: 'pkg/scheduler/scheduler.go:281', c: '07', d: '必须处理 DeletedFinalStateUnknown 墓碑，否则缓存清不干净。' },
+    { k: 'LockNode 节点锁 四个分支 可重入', t: 'nodelock.LockNode()', f: 'pkg/util/nodelock/nodelock.go:255', c: '06', d: '没锁 / 过期 / 是自己（可重入）/ 持锁者已消失。' },
+    { k: 'lockAllDevices ABBA 死锁 sort', t: 'Scheduler.lockAllDevices()', f: 'pkg/scheduler/scheduler.go:962', c: '06', d: 'sort.Strings 固定加锁顺序防 ABBA 死锁，失败逆序回滚。' },
+    { k: 'acquireNodeLocks PodGroup 重试 28秒', t: 'Scheduler.acquireNodeLocks()', f: 'pkg/scheduler/scheduler.go:1001', c: '06', d: 'PodGroup 成员会重试等锁。超时必须和 kube-scheduler 的 httpTimeout 对齐。' },
+    { k: 'Allocate 设备插件 环境变量 注入', t: 'NvidiaDevicePlugin.Allocate()', f: 'pkg/device-plugin/nvidiadevice/nvinternal/plugin/server.go:852', c: '08', d: '猜 pending pod → 读注解 → 擦除 → 注入 env → 放锁。' },
+    { k: 'GetPendingPod 猜 Pod bind-phase allocating', t: 'util.GetPendingPod()', f: 'pkg/util/util.go:76', c: '08', d: '全协议最脆弱的一环。四个筛选条件，靠节点锁保证唯一性。' },
+    { k: 'popNextContainerDevices 消费即擦除 容器序号', t: 'popNextContainerDevices()', f: 'pkg/device-plugin/nvidiadevice/nvinternal/plugin/util.go:112', c: '08', d: '按容器序号换算 init/普通容器。依赖「空容器也占位」的编码约定。' },
+    { k: 'RegisterInAnnotation NVML 扫描 上报', t: 'RegisterInAnnotation()', f: 'pkg/device-plugin/nvidiadevice/nvinternal/plugin/register.go:261', c: '08', d: '30 秒一次。内容没变就不写（deviceCache 去重）。' },
+    { k: 'PodAllocationSuccess 放锁 bind-phase', t: 'PodAllocationSuccess/Failed()', f: 'pkg/device-plugin/nvidiadevice/nvinternal/plugin/util.go:367', c: '08', d: '打 bind-phase 并释放节点锁，闭环第 06 章。' },
+    { k: 'CheckHealth handshake 点名 60秒', t: 'device.CheckHealth()', f: 'pkg/device/devices.go:593', c: '01', d: '握手保活。超时后还要用 Allocatable 交叉验证才判掉线。' },
+    { k: 'UnMarshalNodeDevices JSON 解析节点注解 nvidia register', t: 'MarshalNodeDevices / UnMarshalNodeDevices()', f: 'pkg/device/devices.go:419', c: '01', d: 'hami.io/node-nvidia-register 用的是这套 JSON。nvidia/amd/ascend/biren/kunlun-vdevice/vastai 都走它。字段带 omitempty，零值 key 会消失。' },
+    { k: 'DecodeNodeDevices 逗号串 7 9 字段 hygon iluvatar', t: 'EncodeNodeDevices / DecodeNodeDevices()', f: 'pkg/device/devices.go:317', c: '01', d: '逗号串格式，只有 hygon(DCU) 和 iluvatar 在用。接受 7 或 9 个字段。在 NVIDIA 路径上 EncodeNodeDevices 只用于一行 V(5) 调试日志，不是注解。' },
+    { k: 'omitempty 零值消失 JSON 字段不见了', t: '【概念】omitempty 让零值字段消失', f: 'pkg/device/devices.go:127', c: '01', d: 'DeviceInfo 每个字段都带 omitempty，index:0 / numa:0 / health:false 在 JSON 里根本不会出现。排查时别以为是设备插件漏报了。' },
+    { k: 'EncodePodSingleDevice 编码 Pod 注解 分号', t: 'EncodePodSingleDevice()', f: 'pkg/device/devices.go:476', c: '01', d: '每个容器后面无条件加 ";"，所以字符串总以分隔符结尾。' },
+    { k: 'Resourcereqs 容器序号 init 偏移', t: 'device.Resourcereqs()', f: 'pkg/device/devices.go:656', c: '02', d: '先所有 InitContainer 再所有普通 Container，连续编号。' },
+    { k: 'InitDevicesWithConfig 注册后端 DevicesMap', t: 'InitDevicesWithConfig()', f: 'pkg/scheduler/config/config.go:99', c: '02', d: '所有设备后端在这里注册进全局 DevicesMap。加新硬件改这里。' },
+    { k: 'migRegions 半区 MIG placement', t: 'migRegions()', f: 'pkg/device/nvidia/mig_topology.go:53', c: '10', d: '把卡分成两个半区，打分时尽量保留一整个空半区给大块 profile。' },
+    { k: 'place 装箱 贪心 回溯 预算', t: 'migLayout.place()', f: 'pkg/device/nvidia/mig_topology.go:244', c: '10', d: '最受约束优先 + 贪心 + 回溯 + migSearchBudget=4096 封顶。' },
+    { k: 'calculateGPUPairScore NVLink 分数 拓扑', t: 'calculateGPUPairScore()', f: 'pkg/device/nvidia/calculate_score.go:211', c: '10', d: 'PCIe 类 10-60 分，NVLink 起步 100 分每条。双向不一致判 0 分并告警。' },
+    { k: 'RefitNumaAllocation NUMA 回填 反向调用', t: 'RefitNumaAllocation()', f: 'pkg/scheduler/numa_refit_handler.go:71', c: '10', d: '设备插件反向请求调度器改分配。冲突即失败不重试。' },
+    { k: 'oom_check 显存 OOM 死进程清理 C', t: 'oom_check()', f: 'libvgpu/src/allocator/allocator.c:36', c: '09', d: 'limit==0 直接放行。OOM 前先清理死进程的残留记账再重试。' },
+    { k: 'rate_limiter 令牌桶 算力 nanosleep C', t: 'rate_limiter()', f: 'libvgpu/src/multiprocess/multiprocess_utilization_watcher.c:39', c: '09', d: 'kernel launch 花 grids 个令牌，没票就 nanosleep 阻塞。' },
+    { k: 'find_symbols_in_table 劫持 版本后缀 cuGraph C', t: 'find_symbols_in_table()', f: 'libvgpu/src/cuda/hook.c:317', c: '09', d: '按 _v3 → _v2 → 无后缀顺序找。cuGraph* 被显式跳过（已知缺口）。' },
+    // 概念
+    { k: '超卖 oversell 缓存 informer 延迟', t: '【概念】超卖是怎么发生的', f: 'pkg/scheduler/scheduler.go:1027', c: '06/07', d: 'Filter 的用量来自本地缓存，informer 更新有延迟，两个 Pod 可能被分到同一份显存。节点锁堵这个窗口。' },
+    { k: '资源泄漏 幽灵占用 调度不上去', t: '【概念】资源泄漏', f: 'pkg/scheduler/scheduler.go:956', c: '06/07', d: 'Pod 没了但记账还在。防线：cleanupStalePodAllocation、onDelPod 墓碑处理、15 秒全量对账。' },
+    { k: '为什么只返回一个节点 Prioritize 失效', t: '【概念】Filter 只返回一个节点', f: 'pkg/scheduler/scheduler.go:1183', c: '04', d: '选卡和判可行性是同一件事。代价：kube-scheduler 的打分插件对 GPU Pod 失效。' },
+    { k: '101 哨兵 显存百分比 0 不限制', t: '【概念】为什么用 101 当哨兵', f: 'libvgpu/src/allocator/allocator.c:45', c: '02/09', d: 'HAMi-core 把 limit==0 解释为「不限制」。所以 Go 侧绝不能用 0 表示「未设置」。' },
+    { k: '空容器占位 索引错位 分号', t: '【概念】空容器为什么也要占位', f: 'pkg/device-plugin/nvidiadevice/nvinternal/plugin/util.go:112', c: '01/08', d: '设备插件按容器序号换算 init/普通容器，跳过空容器会导致全部错位。' },
+    { k: '倒序遍历 排序方向 binpack spread', t: '【概念】排序 + 倒序遍历', f: 'pkg/device/nvidia/device.go:865', c: '05', d: 'Fit 从后往前走，所以升序排完「末尾」才是首选。单看排序会得出相反结论。' },
+    { k: 'MIG 向上取整 配额 profile', t: '【概念】MIG 会覆写用户请求值', f: 'pkg/device/nvidia/device.go:790', c: '10', d: '申请 6000MB 会被取整到 2g.10gb=10240，配额也按 10240 扣。' },
+    { k: '劫持失效 特权容器 CUDA Graph 静态链接', t: '【概念】HAMi-core 什么时候失效', f: 'libvgpu/src/cuda/hook.c:320', c: '09', d: '特权容器、CUDA Graph、静态链接、新 CUDA API、改 ld.so.preload。它是公平共享机制，不是安全边界。' },
+  ];
+  const q = document.getElementById('q');
+  const out = document.getElementById('qout');
+  const REPO = SOURCE.repo, C = SOURCE.commit;
+  function link(f) {
+    const m = f.match(/^(.+?):(\d+)$/);
+    return m ? `https://github.com/${REPO}/blob/${C}/${m[1]}#L${m[2]}`
+             : `https://github.com/${REPO}/blob/${C}/${f}`;
+  }
+  const CH = {};
+  CHAPTERS.forEach(g => g.items.forEach(i => CH[i.id] = i));
+  function run() {
+    const s = q.value.trim().toLowerCase();
+    if (!s) { out.innerHTML = '<span class="dim">输入函数名、注解 key 或关键词。比如：Fit、节点锁、超卖、令牌桶、101</span>'; return; }
+    const hits = IDX.filter(x =>
+      (x.k + ' ' + x.t + ' ' + x.f + ' ' + x.d).toLowerCase().includes(s));
+    if (hits.length === 0) {
+      out.innerHTML = `<span class="bad">没找到「${q.value}」</span>\n<span class="dim">试试：Fit / 打分 / 节点锁 / 注解 / MIG / NVLink / 超卖 / 令牌桶 / webhook</span>`;
+      return;
+    }
+    out.innerHTML = hits.map(x => {
+      const ch = CH[x.c] || CH[x.c.split('/')[0]];
+      const chLink = ch ? `<a href="${ch.file}">第 ${x.c} 章</a>` : `第 ${x.c} 章`;
+      return `<span class="key">${x.t}</span>
+  ${x.d}
+  <a href="${link(x.f)}" target="_blank" rel="noopener">${x.f} ↗</a>   ${chLink}`;
+    }).join('\n\n');
+  }
+  q.addEventListener('input', run);
+  run();
+  q.focus();
+})();
+</script>
+</body>
+</html>

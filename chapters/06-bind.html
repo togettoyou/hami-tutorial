@@ -1,0 +1,817 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Bind 与回滚 — HAMi 源码导读</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2316181d'/%3E%3Ctext x='16' y='23' font-size='17' font-family='monospace' font-weight='bold' fill='%23fff' text-anchor='middle'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main class="main">
+
+    <div class="page-kicker">第 06 章 · 第二阶段 一个 Pod 的旅程</div>
+    <h1 class="page-title">Bind：把决策落地，以及失败回滚</h1>
+    <p class="page-lede">
+      Filter 已经选好了节点和卡。Bind 要做的是<strong>抢锁 → 打标 → 真正绑定</strong>，
+      并且保证<strong>任何一步失败都能干净地退回去</strong>。
+      这一章的重点不是「成功路径」，而是那些容易被忽略的失败路径。
+    </p>
+
+    <div class="goals">
+      <h3>学完这章你应该能</h3>
+      <ul>
+        <li>说清楚为什么 Filter 已经算过一遍了，Bind 还要再上一把节点锁</li>
+        <li>画出 Bind 的 6 个步骤和每一步失败时的回滚动作</li>
+        <li>解释 <code>fail()</code> 闭包为什么返回 <code>(result, nil)</code> 而不是 <code>(nil, err)</code></li>
+        <li>说出 <code>bind-phase</code> 注解的三个状态和各自的意义</li>
+        <li>理解 PodGroup（协同调度）场景下的锁重试机制</li>
+      </ul>
+    </div>
+
+    <h2>1. Bind 在整条链路的位置</h2>
+
+    <div class="flow">
+      <div class="node">
+        <div class="h">Filter 返回唯一节点<span class="tag">第 04 章</span></div>
+        <div class="d">Pod 注解已写入：<code>vgpu-node</code>、<code>vgpu-devices-to-allocate</code>、<code>vgpu-time</code></div>
+      </div>
+      <div class="arrow">↓<span class="lbl">kube-scheduler 只剩一个候选，直接调 /bind</span></div>
+      <div class="node">
+        <div class="h">Scheduler.Bind()<span class="tag">本章</span></div>
+        <div class="d">
+          ① 从缓存取 Pod → ② 取 Node → ③ <b>抢所有厂商的节点锁</b> →
+          ④ 打 <code>bind-phase: allocating</code> → ⑤ 调 K8s Bind API → ⑥ 发 event
+        </div>
+        <div class="src"><span data-srcref="pkg/scheduler/scheduler.go:1027"></span></div>
+      </div>
+      <div class="arrow">↓<span class="lbl">Pod.spec.nodeName 被写入</span></div>
+      <div class="node">
+        <div class="h">kubelet 拉起 Pod<span class="tag">第 08 章</span></div>
+        <div class="d">调设备插件 <code>Allocate()</code>，读注解 → 注入环境变量 → <b>释放节点锁</b></div>
+      </div>
+    </div>
+
+    <div class="note warn">
+      <div class="t">注意：节点锁不是在 Bind 里释放的</div>
+      <p style="margin-bottom:0">
+        Bind 成功后，锁<strong>继续持有</strong>，一直到设备插件的 <code>Allocate()</code> 执行完
+        才释放（第 08 章会看到 <code>PodAllocationSuccess</code>）。
+        <br>为什么？因为真正的资源占用发生在 Allocate 那一刻。
+        如果 Bind 完就放锁，另一个 Pod 可能在 kubelet 还没来得及调 Allocate 时就抢进来了。
+        <br>所以锁有 5 分钟超时兜底（<code>NodeLockTimeout</code>），防止设备插件挂了导致死锁。
+      </p>
+    </div>
+
+    <h2>2. 为什么 Filter 算过了还要锁</h2>
+
+    <div class="note analogy">
+      <div class="t">网上选座 vs 检票入场</div>
+      <p>
+        Filter 像<strong>网上选座</strong>：系统告诉你「3 排 5 座是空的」，并帮你标记了。
+        但从选座到你真的坐下，中间有时间差。
+      </p>
+      <p style="margin-bottom:0">
+        问题在于 HAMi 的「已占用」是靠本地缓存算出来的（第 04 章），
+        而缓存的更新依赖 informer 事件 —— <strong>那是异步的，有延迟</strong>。
+        <br>并发场景：Pod A 和 Pod B 几乎同时被调度到 node-1 的同一张卡。
+        A 的 Filter 写完注解，但 informer 事件还没回来更新缓存；
+        这时 B 的 Filter 跑起来，看到的还是「这张卡是空的」→ <strong>超卖</strong>。
+        <br><strong>节点锁就是堵这个窗口的。</strong>
+      </p>
+    </div>
+
+    <h2>3. Bind 全流程</h2>
+
+    <h3>Step 1-2：从缓存取 Pod 和 Node</h3>
+
+    <div class="codeblock" data-file="pkg/scheduler/scheduler.go" data-start="1027" data-lang="go" data-hl="5-8,10,12-21,25,26-31">
+<pre><code>func (s *Scheduler) Bind(args extenderv1.ExtenderBindingArgs) (*extenderv1.ExtenderBindingResult, error) {
+	klog.InfoS("Attempting to bind pod to node", "pod", args.PodName, "namespace", args.PodNamespace, "node", args.Node)
+	var res *extenderv1.ExtenderBindingResult
+
+	binding := &amp;corev1.Binding{                                    // K8s 的 Binding 对象
+		ObjectMeta: metav1.ObjectMeta{Name: args.PodName, UID: args.PodUID},
+		Target:     corev1.ObjectReference{Kind: "Node", Name: args.Node},
+	}
+
+	current, err := s.podLister.Pods(args.PodNamespace).Get(args.PodName)
+	if err != nil {
+		klog.ErrorS(err, "Failed to get pod from cache", "pod", args.PodName, "namespace", args.PodNamespace)
+		s.cleanupStalePodAllocation(&amp;corev1.Pod{                   // 回滚：撤销 Filter 的记账
+			ObjectMeta: metav1.ObjectMeta{
+				UID:       args.PodUID,
+				Name:      args.PodName,
+				Namespace: args.PodNamespace,
+			},
+		})
+		return &amp;extenderv1.ExtenderBindingResult{Error: err.Error()}, err
+	}
+
+	klog.InfoS("Trying to get the target node for pod", "pod", args.PodName, "namespace", args.PodNamespace, "node", args.Node)
+
+	node, err := s.nodeLister.Get(args.Node)
+	if err != nil {
+		klog.ErrorS(err, "Failed to get node from cache", "node", args.Node)
+		s.recordScheduleBindingResultEvent(current, EventReasonBindingFailed, []string{}, fmt.Errorf("failed to get node %s", args.Node))
+		s.cleanupStalePodAllocation(current)                       // 回滚
+		res = &amp;extenderv1.ExtenderBindingResult{Error: err.Error()}
+		return res, nil
+	}</code></pre>
+    </div>
+
+    <div class="note tip">
+      <div class="t"><code>cleanupStalePodAllocation</code>。撤销 Filter 留下的账</div>
+      <div class="codeblock" data-file="pkg/scheduler/scheduler.go" data-start="956" data-lang="go">
+<pre><code>func (s *Scheduler) cleanupStalePodAllocation(pod *corev1.Pod) {
+	if pi, ok := s.podManager.TakeAndDeletePod(pod); ok &amp;&amp; len(pi.Devices) &gt; 0 {
+		s.quotaManager.RmUsage(pod, pi.Devices)
+	}
+}</code></pre>
+      </div>
+      <p style="margin-bottom:0">
+        记得第 04 章 Filter 的 Step 6 吗？它在选中节点后就 <code>AddPod</code> + <code>AddUsage</code> 了。
+        如果 Bind 阶段发现 Pod 已经不存在（被用户删了），那笔账必须撤掉，否则
+        资源会被一个不存在的 Pod 永久占着。这类 bug 叫「资源泄漏」，
+        表现是「明明没跑什么任务，却调度不上去了」。
+      </p>
+    </div>
+
+    <h3>Step 3：fail 闭包：统一的回滚出口</h3>
+
+    <div class="codeblock" data-file="pkg/scheduler/scheduler.go" data-start="1060" data-lang="go" data-hl="1-4,6-14">
+<pre><code>	tmppatch := map[string]string{
+		util.DeviceBindPhase:     "allocating",
+		util.BindTimeAnnotations: strconv.FormatInt(time.Now().Unix(), 10),
+	}
+
+	fail := func(e error) (*extenderv1.ExtenderBindingResult, error) {
+		klog.InfoS("Release node locks", "node", args.Node)
+		s.releaseAllDevices(node, current)                        // 释放所有已抢到的锁
+		s.recordScheduleBindingResultEvent(current, EventReasonBindingFailed, []string{}, e)
+		errStr := ""
+		if e != nil {
+			errStr = e.Error()
+		}
+		return &amp;extenderv1.ExtenderBindingResult{Error: errStr}, nil   // ← 注意：err 位是 nil
+	}</code></pre>
+    </div>
+
+    <div class="note trap">
+      <div class="t"><code>return result, nil</code> 而不是 <code>return nil, err</code>。这是有意的</div>
+      <p>
+        Go 的惯例是出错就返回 <code>error</code>。但这里故意把错误装进结果结构体，第二个返回值给 nil。
+      </p>
+      <p style="margin-bottom:0">
+        原因在 HTTP 层（<span data-srcref="pkg/scheduler/routes/route.go:114"></span>）：
+        如果 <code>Bind()</code> 返回非 nil 的 error，路由会<strong>再包一层</strong>覆盖掉结果；
+        而 K8s extender 协议期望的是「HTTP 200 + body 里的 Error 字段」，
+        这样 kube-scheduler 才能正确识别为「绑定失败，请重新调度」而不是「扩展器故障」。
+        <br>返回 <code>(nil, err)</code> 会让 kube-scheduler 的重试行为变得不可预期。
+        <br><em>读代码时看到「反直觉的返回值」，先去看调用方怎么处理的，往往能找到原因。</em>
+      </p>
+    </div>
+
+    <h3>Step 4：抢锁（本章核心）</h3>
+
+    <div class="codeblock" data-file="pkg/scheduler/scheduler.go" data-start="1076" data-lang="go" data-hl="1-4">
+<pre><code>	if err = s.acquireNodeLocks(node, current); err != nil {
+		klog.ErrorS(err, "Failed to lock node", "node", args.Node, "pod", klog.KObj(current))
+		return fail(err)
+	}
+
+	if err = util.PatchPodAnnotations(current, tmppatch); err != nil {   // 打 bind-phase: allocating
+		klog.ErrorS(err, "Failed to patch pod annotations", "pod", klog.KObj(current))
+		return fail(err)
+	}
+
+	if err = s.kubeClient.CoreV1().Pods(args.PodNamespace).Bind(context.Background(), binding, metav1.CreateOptions{}); err != nil {
+		klog.ErrorS(err, "Failed to bind pod", "pod", args.PodName, "namespace", args.PodNamespace, "node", args.Node)
+		return fail(err)                                                 // ← 三处都走同一个出口
+	}
+
+	s.recordScheduleBindingResultEvent(current, EventReasonBindingSucceed, []string{args.Node}, nil)
+	klog.InfoS("Successfully bound pod to node", "pod", args.PodName, "namespace", args.PodNamespace, "node", args.Node)
+	return &amp;extenderv1.ExtenderBindingResult{Error: ""}, nil
+}</code></pre>
+    </div>
+
+    <p>抢锁要抢<strong>所有厂商的</strong>，而且失败要按<strong>逆序</strong>回滚：</p>
+
+    <div class="codeblock" data-file="pkg/scheduler/scheduler.go" data-start="962" data-lang="go" data-hl="3-8,10,12-14,15-21,23">
+<pre><code>func (s *Scheduler) lockAllDevices(node *corev1.Node, pod *corev1.Pod) error {
+	devs := device.GetDevices()
+	keys := make([]string, 0, len(devs))
+	for k := range devs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)                                     // 固定顺序！
+
+	acquired := make([]device.Devices, 0, len(keys))
+	for _, k := range keys {
+		val := devs[k]
+		if err := val.LockNode(node, pod); err != nil {
+			for _, locked := range slices.Backward(acquired) {           // 逆序释放
+				if relErr := locked.ReleaseNodeLock(node, pod); relErr != nil {
+					klog.ErrorS(relErr, "Failed to release node lock during rollback", "node", node.Name, "pod", klog.KObj(pod))
+				}
+			}
+			return err
+		}
+		acquired = append(acquired, val)
+	}
+	return nil
+}</code></pre>
+    </div>
+
+    <div class="note">
+      <div class="t"><code>sort.Strings(keys)</code>。一行代码防死锁</div>
+      <p>
+        Go 的 map 遍历顺序是<strong>随机的</strong>。如果不排序，两个并发的 Bind 可能是：
+      </p>
+      <div class="codeblock" data-lang="text" data-title="没有排序会发生什么">
+<pre><code>Pod A 的 Bind：先锁 NVIDIA → 再锁 MLU
+Pod B 的 Bind：先锁 MLU    → 再锁 NVIDIA
+
+时刻 1：A 拿到 NVIDIA，B 拿到 MLU
+时刻 2：A 等 MLU（B 持有），B 等 NVIDIA（A 持有）
+        ↓
+     经典的 ABBA 死锁</code></pre>
+      </div>
+      <p style="margin-bottom:0">
+        固定加锁顺序是解决 ABBA 死锁的标准方法，
+        这行 <code>sort.Strings</code> 就是干这个的。
+        <br>（HAMi 的多厂商锁实际都指向同一个注解 key <code>hami.io/mutex.lock</code>，
+        所以这里更多是防御性写法。）
+      </p>
+    </div>
+
+    <h2>4. 节点锁：用注解实现的分布式锁</h2>
+
+    <p>
+      HAMi 没用 Lease、没用 etcd 的事务，就用了<strong>一条 Node 注解</strong>：
+    </p>
+
+    <div class="codeblock" data-file="pkg/util/nodelock/nodelock.go" data-start="39" data-lang="go" data-hl="2-3">
+<pre><code>const (
+	NodeLockKey = "hami.io/mutex.lock"
+	NodeLockSep = ","
+)</code></pre>
+    </div>
+
+    <p>注解的值格式是「<strong>时间戳,命名空间,Pod 名</strong>」：</p>
+
+    <div class="codeblock" data-file="pkg/util/nodelock/nodelock.go" data-start="330" data-lang="go" data-hl="2-5,8-13">
+<pre><code>func GenerateNodeLockKeyByPod(pod *corev1.Pod) string {
+	if pod == nil {
+		return time.Now().Format(time.RFC3339)
+	}
+	return fmt.Sprintf("%s%s%s", time.Now().Format(time.RFC3339), NodeLockSep, GeneratePodNamespaceName(pod, NodeLockSep))
+}
+
+func GeneratePodNamespaceName(pod *corev1.Pod, sep string) string {
+	if pod == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s%s%s", pod.Namespace, sep, pod.Name)
+}</code></pre>
+    </div>
+
+    <div class="lab">
+      <header>节点锁状态机模拟器<span class="badge">互动</span></header>
+      <div class="body">
+        <p style="font-size:13.5px;color:var(--fg-soft);margin-bottom:12px">
+          Pod 来抢锁时，<code>LockNode()</code> 会根据锁的当前状态走不同分支。点击场景看判定过程。
+        </p>
+        <div id="lockScenes"></div>
+        <div class="out" id="lockOut">点上面任意一个场景</div>
+      </div>
+    </div>
+
+    <h3>4.1 LockNode 的四个分支</h3>
+
+    <div class="codeblock" data-file="pkg/util/nodelock/nodelock.go" data-start="255" data-lang="go" data-hl="6-10,17-19,21-24,26-29,31-38,40-49,51-58,60">
+<pre><code>func LockNode(nodeName string, lockname string, pods *corev1.Pod) error {
+	if pods == nil {
+		return fmt.Errorf("cannot lock node: pod is nil")
+	}
+	...
+	// Acquire per-node lock instead of global lock
+	nodeLock := nodeLocks.getLock(nodeName)      // ← 先拿进程内的 mutex
+	nodeLock.Lock()
+	defer nodeLock.Unlock()
+
+	ctx := context.Background()
+	node, err := client.GetClient().CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if _, ok := node.Annotations[NodeLockKey]; !ok {
+		return setNodeLockLocked(nodeName, lockname, pods)    // 【分支 1】没锁 → 直接上锁
+	}
+	lockTime, ns, previousPodName, err := ParseNodeLock(node.Annotations[NodeLockKey])
+	if err != nil {
+		return err
+	}
+
+	var skipOwnerCheck = false
+	if time.Since(lockTime) &gt; NodeLockTimeout {
+		klog.InfoS("Node lock expired", "node", nodeName, "lockTime", lockTime, "timeout", NodeLockTimeout)
+		skipOwnerCheck = true                                 // 【分支 2】锁过期 → 强行抢
+	} else if ns == pods.Namespace &amp;&amp; previousPodName == pods.Name {
+		// The lock is already held by this exact pod. lockAllDevices calls
+		// LockNode once per device vendor a pod requests resources from, so
+		// a pod requesting resources from two or more vendors (e.g. both
+		// nvidia.com/gpu and cambricon.com/vmlu) would otherwise contend
+		// with its own still-valid lock on the second call and never
+		// become schedulable. Treat this as already acquired.
+		klog.V(4).InfoS("Node lock already held by this pod, treating as acquired", "node", nodeName, "podName", pods.Name)
+		return nil                                            // 【分支 3】就是我自己 → 可重入
+	} else if ns != "" &amp;&amp; previousPodName != "" {
+		// Check dangling nodeLock
+		if _, err := client.GetClient().CoreV1().Pods(ns).Get(ctx, previousPodName, metav1.GetOptions{}); err != nil {
+			if !apierrors.IsNotFound(err) {
+				klog.ErrorS(err, "Failed to get pod of NodeLock", "podName", previousPodName, "namespace", ns)
+				return err
+			}
+			klog.InfoS("Previous pod of NodeLock not found, releasing lock", ...)
+			skipOwnerCheck = true                             // 【分支 4】持锁者已消失 → 抢
+		}
+	}
+
+	if skipOwnerCheck {
+		err = releaseNodeLockLocked(nodeName, lockname, pods, true)
+		if err != nil {
+			klog.ErrorS(err, "Failed to release node lock", "node", nodeName)
+			return err
+		}
+		return setNodeLockLocked(nodeName, lockname, pods)
+	}
+
+	return fmt.Errorf("node %s has been locked within %v: %w", nodeName, NodeLockTimeout, ErrNodeLockContention)
+}</code></pre>
+    </div>
+
+    <div class="note tip">
+      <div class="t">分支 3 的注释解释了一个真实 bug</div>
+      <p style="margin-bottom:0">
+        一个 Pod 同时要 NVIDIA GPU 和寒武纪 MLU 时，<code>lockAllDevices</code> 会调
+        <code>LockNode</code> <strong>两次</strong>（每个厂商一次）。
+        第二次调用时锁已经被<strong>自己</strong>持有了 —— 如果没有分支 3，
+        它会跟自己竞争，<strong>永远调度不上去</strong>。
+        <br>这就是<strong>可重入锁</strong>的必要性。注释里把这个场景写得很清楚，
+        说明这是踩过坑之后补上的。
+      </p>
+    </div>
+
+    <h3>4.2 两层锁：进程内 mutex + 集群级注解</h3>
+
+    <div class="codeblock" data-file="pkg/util/nodelock/nodelock.go" data-start="69" data-lang="go" data-hl="4-7,12-19">
+<pre><code>// nodeLockManager manages locks on a per-node basis to allow concurrent
+// operations on different nodes while maintaining mutual exclusion for
+// operations on the same node.
+type nodeLockManager struct {
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex     // 每个节点一把进程内 mutex
+}
+...
+// getLock returns the mutex for a specific node, creating it if necessary.
+// This method is thread-safe.
+func (m *nodeLockManager) getLock(nodeName string) *sync.Mutex {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.locks[nodeName]; !ok {
+		m.locks[nodeName] = &amp;sync.Mutex{}
+	}
+	return m.locks[nodeName]
+}</code></pre>
+    </div>
+
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:170px">层</th><th style="width:150px">范围</th><th>解决什么问题</th></tr>
+      <tr>
+        <td><b>进程内 mutex</b><br><code>nodeLocks.getLock(node)</code></td>
+        <td>单个调度器进程<br>内部的多 goroutine</td>
+        <td>避免同一进程内多个 Bind 同时读改同一个 Node 注解，产生 read-modify-write 竞态。<br><b>粒度是每节点一把</b>，不同节点可以并行</td>
+      </tr>
+      <tr>
+        <td><b>集群级注解锁</b><br><code>hami.io/mutex.lock</code></td>
+        <td>整个集群<br>（多副本调度器）</td>
+        <td>调度器 HA 部署时，多个副本之间的互斥。<br>靠 <code>resourceVersion</code> 做乐观并发控制</td>
+      </tr>
+    </table>
+    </div>
+
+    <p>注解锁的写入用了 resourceVersion 乐观锁 + 重试：</p>
+
+    <div class="codeblock" data-file="pkg/util/nodelock/nodelock.go" data-start="144" data-lang="go" data-hl="7-9,11-13,18-21,23-25,27">
+<pre><code>func setNodeLockLocked(nodeName string, lockname string, pods *corev1.Pod) error {
+	ctx := context.Background()
+	node, err := client.GetClient().CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if _, ok := node.Annotations[NodeLockKey]; ok {
+		return fmt.Errorf("node %s is locked: %w", nodeName, ErrNodeLockContention)
+	}
+	lockOwner := NodeLockSep + GeneratePodNamespaceName(pods, NodeLockSep)
+	err = retry.OnError(DefaultStrategy, func(err error) bool {
+		return !IsNodeLockContention(err)                  // 竞争不重试，其他错误才重试
+	}, func() error {
+		node, err = client.GetClient().CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+		if err != nil {
+			klog.ErrorS(err, "Failed to get node when retry to patch", "node", nodeName)
+			return err
+		}
+		lockStr, ok := node.Annotations[NodeLockKey]
+		if ok &amp;&amp; strings.Contains(lockStr, NodeLockSep) &amp;&amp; strings.HasSuffix(lockStr, lockOwner) {
+			return nil                                     // 已经是我的锁了，幂等返回
+		}
+		if ok {
+			return fmt.Errorf("node %s is locked: %w", nodeName, ErrNodeLockContention)
+		}
+		patchData := fmt.Sprintf(`{"metadata":{"annotations":{"%s":"%s"},"resourceVersion":"%s"}}`, NodeLockKey, GenerateNodeLockKeyByPod(pods), node.ResourceVersion)
+		_, err = client.GetClient().CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, []byte(patchData), metav1.PatchOptions{})
+		...
+	})
+	...
+}</code></pre>
+    </div>
+
+    <div class="note">
+      <div class="t"><code>resourceVersion</code> 在 patch 里的作用</div>
+      <p style="margin-bottom:0">
+        把读到的 <code>resourceVersion</code> 一起写进 patch，apiserver 会检查
+        「这个对象自你读取之后有没有被别人改过」。改过就返回 409 Conflict，
+        <code>retry.OnError</code> 重新读一遍再试。
+        <br>这就是 Compare-And-Swap，只不过用 HTTP 实现的。
+        <br>重试策略在 <span data-srcref="pkg/util/nodelock/nodelock.go:57"></span>：
+        5 次，100ms 起步，指数退避 2 倍，带 0.5 抖动。
+      </p>
+    </div>
+
+    <h2>5. PodGroup 场景：为什么需要重试等待</h2>
+
+    <p>
+      协同调度（Gang Scheduling）场景下，一批 Pod 必须要么全部调度成功，要么全部失败。
+      比如一个 8 卡的分布式训练任务，拆成 8 个 Pod。
+    </p>
+
+    <div class="note trap">
+      <div class="t">问题：同一个 PodGroup 的成员会互相抢锁</div>
+      <p style="margin-bottom:0">
+        如果 8 个 Pod 都要调度到同一个节点，它们会<strong>依次去抢同一把节点锁</strong>。
+        第 1 个抢到，第 2~8 个直接失败返回 —— 然后整个 PodGroup 调度失败，
+        下一轮又是同样的结果，<strong>永远起不来</strong>。
+      </p>
+    </div>
+
+    <div class="codeblock" data-file="pkg/scheduler/scheduler.go" data-start="1001" data-lang="go" data-hl="2-4,6,8-11,13-15,16-19,20-25">
+<pre><code>func (s *Scheduler) acquireNodeLocks(node *corev1.Node, pod *corev1.Pod) error {
+	if !util.IsPodGroupMember(pod) || config.NodeLockRetryTimeout &lt;= 0 {
+		return s.lockAllDevices(node, pod)                    // 普通 Pod：抢不到就失败
+	}
+
+	deadline := time.Now().Add(config.NodeLockRetryTimeout)
+
+	for {
+		err := s.lockAllDevices(node, pod)
+		if err == nil {
+			return nil
+		}
+		if !nodelockutil.IsNodeLockContention(err) {
+			return err                                        // 不是竞争导致的错误 → 立即失败
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after %v waiting for node %s to be unlocked: %w",
+				config.NodeLockRetryTimeout, node.Name, nodelockutil.ErrNodeLockContention)
+		}
+		select {
+		case &lt;-s.stopCh:
+			return fmt.Errorf("scheduler shutting down while waiting for node lock: %w", nodelockutil.ErrNodeLockContention)
+		case &lt;-time.After(100 * time.Millisecond):            // 等 100ms 再试
+		}
+	}
+}</code></pre>
+    </div>
+
+    <div class="note warn">
+      <div class="t">这里有个必须注意的配置耦合</div>
+      <p style="margin-bottom:0">
+        <code>NodeLockRetryTimeout</code> 默认 <strong>28 秒</strong>
+        （见 <span data-srcref="cmd/scheduler/main.go:80"></span>）。
+        那条 flag 的帮助文本明确说了：
+        <em>「Align the Extender's httpTimeout in KubeSchedulerConfiguration with this value.」</em>
+        <br>如果 kube-scheduler 那边的 <code>httpTimeout</code> 小于 28 秒，
+        它会在 HAMi 还在等锁时就超时断开，然后重新发起调度，前面的等待白费。
+        <br><em>部署时这是个真实的坑。Helm chart 里两个值应该是配套的。</em>
+      </p>
+    </div>
+
+    <h2>6. bind-phase 状态机</h2>
+
+    <div class="tbl-wrap">
+    <table>
+      <tr><th style="width:130px">值</th><th style="width:150px">谁写的</th><th>含义</th></tr>
+      <tr><td><code>allocating</code></td><td>调度器 Bind</td><td>已抢到锁，正在绑定；设备插件用它来找「该给谁分配」</td></tr>
+      <tr><td><code>success</code></td><td>设备插件 Allocate</td><td>环境变量已注入，锁已释放</td></tr>
+      <tr><td><code>failed</code></td><td>设备插件 Allocate</td><td>分配失败，锁已释放，Pod 需要重新调度</td></tr>
+    </table>
+    </div>
+
+    <div class="note tip">
+      <div class="t"><code>allocating</code> 是设备插件的「寻人启事」</div>
+      <p style="margin-bottom:0">
+        第 08 章会看到，设备插件的 <code>Allocate()</code> 收到 kubelet 请求时，
+        并不知道这是给哪个 Pod 的（gRPC 请求里只有设备 ID，没有 Pod 信息）。
+        它是靠 <code>getPendingPod(nodename)</code> 去找「本节点上 <code>bind-phase=allocating</code> 且时间最早的那个 Pod」。
+        <br>这是整个协议里<strong>最脆弱的一环</strong>：如果两个 Pod 同时处于 allocating 状态，
+        就可能张冠李戴。节点锁的存在正是为了保证同一时刻只有一个 Pod 处于 allocating。
+      </p>
+    </div>
+
+    <h2>7. 失败路径全景</h2>
+
+    <div class="lab">
+      <header>Bind 失败回滚追踪<span class="badge">互动</span></header>
+      <div class="body">
+        <div class="field-row">
+          <div style="flex:1 1 260px">
+            <label class="f">在哪一步失败</label>
+            <select id="bindFail">
+              <option value="ok">不失败（成功路径）</option>
+              <option value="pod">Step 1：Pod 从缓存取不到（被用户删了）</option>
+              <option value="node">Step 2：Node 取不到（节点被摘除）</option>
+              <option value="lock">Step 4：抢锁失败（另一个 Pod 正在 allocating）</option>
+              <option value="patch">Step 5：打 bind-phase 注解失败</option>
+              <option value="bind">Step 6：调 K8s Bind API 失败</option>
+            </select>
+          </div>
+        </div>
+        <div class="out" id="bindOut"></div>
+      </div>
+    </div>
+
+    <h2>8. 动手实验</h2>
+
+    <ol class="steps">
+      <li>
+        <span class="st">跑节点锁的测试</span>
+        <div class="codeblock" data-lang="bash"><pre><code>go test ./pkg/util/nodelock/ -v -count=1
+grep -n "^func Test" pkg/util/nodelock/*_test.go</code></pre></div>
+      </li>
+      <li>
+        <span class="st">验证可重入：同一个 Pod 连续 LockNode 两次</span>
+        <div class="codeblock" data-lang="bash"><pre><code># 找到测这个场景的用例（多厂商 Pod）
+grep -n "already held\|reentran\|same pod" pkg/util/nodelock/*_test.go</code></pre></div>
+      </li>
+      <li>
+        <span class="st">跑 Bind 相关测试</span>
+        <div class="codeblock" data-lang="bash"><pre><code>go test ./pkg/scheduler/ -run "TestBind|Test_Bind" -v -count=1
+grep -n "func Test.*Bind" pkg/scheduler/*_test.go</code></pre></div>
+      </li>
+      <li>
+        <span class="st">看真实集群里的锁长什么样</span>
+        <div class="codeblock" data-lang="bash"><pre><code># 如果你有一个装了 HAMi 的集群
+kubectl get node &lt;gpu-node&gt; -o jsonpath='{.metadata.annotations.hami\.io/mutex\.lock}'
+# 输出形如：2026-09-02T10:31:04Z,default,my-training-pod
+
+# 卡住的时候手动解锁（应急手段，谨慎使用）
+kubectl annotate node &lt;gpu-node&gt; hami.io/mutex.lock-</code></pre></div>
+      </li>
+      <li>
+        <span class="st">自己实验超时行为</span>
+        <div class="codeblock" data-lang="bash"><pre><code># 锁超时可以用环境变量调（默认 5 分钟）
+grep -n "HAMI_NODELOCK_EXPIRE" -A 10 pkg/util/nodelock/nodelock.go</code></pre></div>
+      </li>
+    </ol>
+
+    <h2>9. 本章自测</h2>
+
+    <div class="quiz" data-answer="C">
+      <div class="q">Filter 阶段已经算过资源了，为什么 Bind 还要抢节点锁？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>为了防止节点被其他管理员 drain</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>K8s Bind API 要求必须持有锁</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>Filter 的用量来自本地缓存，而缓存靠异步的 informer 事件更新，有延迟窗口会导致并发超卖</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>为了给 vGPUmonitor 发信号</span></div>
+      <div class="expl">
+        Pod A 的 Filter 写完注解后，informer 事件要过一会儿才会更新
+        <code>podManager</code> 缓存。这个窗口期内，Pod B 的 Filter 看到的还是旧账本，
+        会把同一张卡的同一份显存再分一次。
+        <br>节点锁把「从 Bind 开始到设备插件 Allocate 完成」这一整段变成临界区，
+        保证同一时刻只有一个 Pod 在这个节点上落地。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="A">
+      <div class="q"><code>lockAllDevices</code> 里那行 <code>sort.Strings(keys)</code> 是干什么的？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>固定加锁顺序，防止多个 Bind 之间形成 ABBA 死锁</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>让日志输出更整齐</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>保证 NVIDIA 优先被处理</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>提升 map 遍历性能</span></div>
+      <div class="expl">
+        Go 的 map 遍历顺序是随机的。如果 Pod A 按「NVIDIA→MLU」的顺序加锁，
+        Pod B 按「MLU→NVIDIA」，就可能各持一把、互相等待，形成经典的 ABBA 死锁。
+        所有并发路径按同一个固定顺序获取多把锁，是解决这类死锁的标准方法。
+        <br>注意后面的回滚是 <code>slices.Backward(acquired)</code>。<strong>逆序释放</strong>，
+        这也是配套的规范做法。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="B">
+      <div class="q"><code>LockNode</code> 发现锁的持有者「就是当前这个 Pod 自己」时，为什么直接返回 nil 而不是报竞争？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>为了性能优化</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>一个 Pod 同时申请多家厂商资源时，<code>lockAllDevices</code> 会调 LockNode 多次，不可重入的话它会跟自己竞争，永远调度不上去</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>因为锁已经过期了</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>为了兼容旧版本</span></div>
+      <div class="expl">
+        代码里那段长注释写得很明白：一个同时要 <code>nvidia.com/gpu</code> 和
+        <code>cambricon.com/vmlu</code> 的 Pod，会触发两次 <code>LockNode</code>。
+        第二次时锁已经被自己持有 —— 如果判定为竞争失败，这个 Pod <strong>永远无法完成绑定</strong>。
+        <br>所以这里实现了<strong>可重入锁</strong>。从注释的详细程度看，这是修复某个真实 issue 时补上的。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="D">
+      <div class="q">Bind 成功之后，节点锁什么时候释放？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>Bind 函数返回前立即释放</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>Pod 变成 Running 时</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>永远不释放，只靠 5 分钟超时</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>设备插件的 <code>Allocate()</code> 执行完之后（成功或失败都释放），5 分钟超时是兜底</span></div>
+      <div class="expl">
+        真正的资源占用发生在设备插件注入环境变量的那一刻。
+        Bind 只是写了 <code>spec.nodeName</code>，kubelet 还要过一会儿才会调 <code>Allocate()</code>。
+        这中间如果放锁，另一个 Pod 可能抢先占用。
+        <br>第 08 章会看到设备插件里的 <code>PodAllocationSuccess</code> / <code>PodAllocationFailed</code>，
+        它们负责释放锁。<code>NodeLockTimeout</code>（默认 5 分钟）是防止设备插件挂掉导致永久死锁的兜底。
+      </div>
+    </div>
+
+    <h2>10. 小结</h2>
+
+    <ul>
+      <li>Bind 的价值不在「绑定」这个动作本身，而在 <b>抢锁</b> 和 <b>失败回滚</b>。</li>
+      <li>锁的生命周期是 Bind 开始 → 设备插件 Allocate 结束，跨越了两个进程，靠 5 分钟超时兜底。</li>
+      <li>多厂商加锁必须 固定顺序（sort）+ 逆序回滚，防 ABBA 死锁。</li>
+      <li>节点锁是<b>两层</b>：进程内每节点一把 mutex + 集群级注解 CAS（resourceVersion 乐观锁）。</li>
+      <li>锁<b>可重入</b>（同一 Pod 多次加锁）、<b>可抢占</b>（超时 或 持锁 Pod 已消失）。</li>
+      <li>PodGroup 成员会<b>重试等锁</b>，超时时间必须和 kube-scheduler 的 <code>httpTimeout</code> 对齐。</li>
+      <li><code>fail()</code> 返回 <code>(result, nil)</code> 是为了让 kube-scheduler 正确识别「绑定失败」而非「扩展器故障」。</li>
+    </ul>
+
+    <p class="next-hint">本章已经碰到了几个并发问题的边角。下一章<strong>系统地</strong>过一遍 HAMi 的并发与一致性设计：
+        informer 事件回调、缓存生命周期、选主 —— 这是最容易出 bug、
+        <strong>也最容易做出高价值贡献</strong>的地方。</p>
+
+    <div class="chapter-nav" id="chapterNav"></div>
+  </main>
+</div>
+
+<script src="../assets/js/site.js"></script>
+<script>
+/* ========== 实验室 1：节点锁状态机 ========== */
+(function () {
+  const SCENES = [
+    { n: '节点没有锁', d: [
+      ['ok','node.Annotations["hami.io/mutex.lock"] 不存在'],
+      ['ok','【分支 1】→ setNodeLockLocked()'],
+      ['dim','  patch 写入：2026-09-02T10:31:04Z,default,my-pod'],
+      ['dim','  同时带上 resourceVersion 做 CAS，冲突就退避重试（最多 5 次）'],
+      ['ok','return nil —— 抢锁成功'],
+    ]},
+    { n: '锁被别的 Pod 持有（未过期）', d: [
+      ['warn','锁值：2026-09-02T10:30:50Z,default,<b>other-pod</b>'],
+      ['dim','time.Since(lockTime) = 14s < NodeLockTimeout(5m) → 没过期'],
+      ['dim','ns/name 不匹配当前 Pod → 不是分支 3'],
+      ['dim','去 apiserver 查 other-pod → <span class="ok">存在</span> → 不是分支 4'],
+      ['bad','return ErrNodeLockContention'],
+      ['dim','  普通 Pod：Bind 走 fail() → 释放已抢到的锁 → 返回绑定失败'],
+      ['dim','  PodGroup 成员：acquireNodeLocks 会每 100ms 重试，最多 28 秒'],
+    ]},
+    { n: '锁是当前 Pod 自己的（可重入）', d: [
+      ['warn','锁值：2026-09-02T10:31:04Z,default,<b>my-pod</b>'],
+      ['ok','ns == pods.Namespace && previousPodName == pods.Name'],
+      ['ok','【分支 3】→ return nil（视为已获得）'],
+      ['dim','  为什么需要这个分支：'],
+      ['dim','  一个 Pod 同时要 nvidia.com/gpu 和 cambricon.com/vmlu 时，'],
+      ['dim','  lockAllDevices 会调 LockNode 两次。'],
+      ['dim','  没有可重入，第二次就会跟自己竞争 → 永远调度不上去。'],
+    ]},
+    { n: '锁已过期（超过 5 分钟）', d: [
+      ['warn','锁值：2026-09-02T10:20:00Z,default,stuck-pod'],
+      ['bad','time.Since(lockTime) = 11m > NodeLockTimeout(5m)'],
+      ['warn','【分支 2】skipOwnerCheck = true'],
+      ['ok','releaseNodeLockLocked(..., skipOwnerCheck=true) —— 强行摘掉旧锁'],
+      ['ok','setNodeLockLocked() —— 换成自己的锁'],
+      ['dim','  这是防死锁的兜底：设备插件崩了没释放锁，5 分钟后自动可抢。'],
+      ['dim','  超时可通过环境变量 HAMI_NODELOCK_EXPIRE 调整。'],
+    ]},
+    { n: '持锁的 Pod 已经不存在了', d: [
+      ['warn','锁值：2026-09-02T10:31:00Z,default,deleted-pod（4 秒前，没过期）'],
+      ['dim','去 apiserver 查 deleted-pod'],
+      ['bad','apierrors.IsNotFound → Pod 已被删除'],
+      ['warn','【分支 4】skipOwnerCheck = true → 释放悬挂锁 → 重新上锁'],
+      ['dim','  这叫「dangling lock」清理。没有它，一个被快速删除的 Pod'],
+      ['dim','  会把节点锁住整整 5 分钟，期间没有任何 Pod 能调度上去。'],
+    ]},
+  ];
+  const host = document.getElementById('lockScenes');
+  const out = document.getElementById('lockOut');
+  host.innerHTML = '<div style="display:flex;flex-wrap:wrap;gap:7px">' +
+    SCENES.map((s, i) => `<button class="btn ghost" data-i="${i}" style="font-size:12px;padding:5px 11px">${s.n}</button>`).join('') + '</div>';
+  host.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+    const s = SCENES[+b.dataset.i];
+    out.innerHTML = `<span class="key">场景：${s.n}</span>\n<span class="dim">pkg/util/nodelock/nodelock.go:255 LockNode()</span>\n\n`
+      + s.d.map(([c, t]) => `<span class="${c}">${c === 'ok' ? '✓' : c === 'bad' ? '✗' : c === 'warn' ? '→' : ' '}</span> <span class="${c === 'dim' ? 'dim' : ''}">${t}</span>`).join('\n');
+  }));
+})();
+
+/* ========== 实验室 2：Bind 失败回滚 ========== */
+(function () {
+  const sel = document.getElementById('bindFail');
+  const out = document.getElementById('bindOut');
+  const P = {
+    ok: [
+      ['ok','Step 1','podLister.Get(pod) → 拿到 Pod'],
+      ['ok','Step 2','nodeLister.Get(node) → 拿到 Node'],
+      ['ok','Step 3','定义 fail 闭包（统一回滚出口）'],
+      ['ok','Step 4','acquireNodeLocks → lockAllDevices → 所有厂商锁到手'],
+      ['key','','  Node 注解写入 hami.io/mutex.lock: 2026-09-02T10:31:04Z,default,my-pod'],
+      ['ok','Step 5','PatchPodAnnotations → hami.io/bind-phase: allocating'],
+      ['key','','  ↑ 设备插件靠这个注解找到「该给谁分配」'],
+      ['ok','Step 6','kubeClient.Pods(ns).Bind(binding) → 写入 spec.nodeName'],
+      ['ok','','recordScheduleBindingResultEvent(BindingSucceed)'],
+      ['ok','','return ExtenderBindingResult{Error: ""}'],
+      ['dim','','注意：节点锁此时<b>仍然持有</b>，'],
+      ['dim','','   要等设备插件 Allocate() 完成才释放（第 08 章）。'],
+      ['ok','','kubelet 开始拉起 Pod → 调设备插件 Allocate()'],
+    ],
+    pod: [
+      ['bad','Step 1','podLister.Get(pod) 失败 —— Pod 在调度过程中被用户删除了'],
+      ['warn','回滚','cleanupStalePodAllocation(伪造一个只有 UID/Name/NS 的 Pod)'],
+      ['ok','','  podManager.TakeAndDeletePod() —— 撤销 Filter 阶段的 AddPod'],
+      ['ok','','  quotaManager.RmUsage()        —— 撤销 Filter 阶段的 AddUsage'],
+      ['dim','','  ↑ 不撤销的话，一个已经不存在的 Pod 会永久占着显存配额，'],
+      ['dim','','     表现为「集群明明空着却调度不上去」—— 典型的资源泄漏 bug。'],
+      ['bad','','return {Error: ...}, err'],
+      ['dim','','注意：这一步还没抢锁，所以不需要 releaseAllDevices。'],
+    ],
+    node: [
+      ['ok','Step 1','拿到 Pod'],
+      ['bad','Step 2','nodeLister.Get(node) 失败 —— 节点被摘除/正在 drain'],
+      ['warn','回滚','recordScheduleBindingResultEvent(BindingFailed)'],
+      ['ok','','cleanupStalePodAllocation(current) —— 撤销记账'],
+      ['bad','','return {Error: ...}, <b>nil</b>'],
+      ['dim','','  ↑ 第二个返回值是 nil，让 kube-scheduler 认为是「绑定失败」'],
+      ['dim','','     而不是「扩展器故障」，从而正确触发重新调度。'],
+    ],
+    lock: [
+      ['ok','Step 1-3','正常'],
+      ['bad','Step 4','lockAllDevices → LockNode 返回 ErrNodeLockContention'],
+      ['dim','','  说明该节点上已有另一个 Pod 处于 allocating 状态'],
+      ['warn','','若是 PodGroup 成员：每 100ms 重试，最多等 NodeLockRetryTimeout(28s)'],
+      ['warn','','若是普通 Pod 或已超时 → return fail(err)'],
+      ['warn','fail()','releaseAllDevices(node, current) —— 释放<b>已经抢到的那部分</b>锁'],
+      ['dim','','  lockAllDevices 内部也做了逆序回滚，这里是双保险'],
+      ['ok','','recordScheduleBindingResultEvent(BindingFailed)'],
+      ['bad','','return {Error: "node xxx has been locked within 5m0s"}, nil'],
+      ['dim','','注意：这条路径<b>没有</b>调 cleanupStalePodAllocation，'],
+      ['dim','','   Filter 的记账仍然保留 —— 因为重新调度时 Filter 的'],
+      ['dim','','   TakeAndDeletePod 会处理它（第 04 章 Step 3）。'],
+    ],
+    patch: [
+      ['ok','Step 1-4','正常，锁已到手'],
+      ['bad','Step 5','PatchPodAnnotations 失败（apiserver 限流 / 409 冲突）'],
+      ['warn','fail()','releaseAllDevices —— <b>必须放锁</b>！'],
+      ['dim','','  不放的话这个节点会被锁死 5 分钟，'],
+      ['dim','','  期间任何 GPU Pod 都调度不到这台机器上。'],
+      ['ok','','recordScheduleBindingResultEvent(BindingFailed)'],
+      ['bad','','return {Error: ...}, nil'],
+    ],
+    bind: [
+      ['ok','Step 1-5','全部正常，锁已到手，bind-phase 已打上'],
+      ['bad','Step 6','kubeClient.Bind() 失败（节点 NotReady / Pod 已被删 / 已被绑定）'],
+      ['warn','fail()','releaseAllDevices —— 放锁'],
+      ['ok','','recordScheduleBindingResultEvent(BindingFailed)'],
+      ['bad','','return {Error: ...}, nil'],
+      ['warn','遗留','hami.io/bind-phase: allocating 这条注解<b>没有被清理</b>'],
+      ['dim','','  如果 Pod 还在，它会一直带着 allocating 标记。'],
+      ['dim','','  下一轮调度重新走 Filter/Bind 会覆盖它，所以通常没问题；'],
+      ['dim','','  但如果同节点有别的 Pod 也在 allocating，设备插件的'],
+      ['dim','','  getPendingPod() 就可能选错 Pod —— 这是协议里最脆弱的一环。'],
+    ],
+  };
+  function run() {
+    out.innerHTML = P[sel.value].map(([c, step, text]) =>
+      `<span class="${c}">${(step || '').padEnd(7)}</span> <span class="${c === 'dim' || c === 'key' ? c : ''}">${text}</span>`).join('\n');
+  }
+  sel.addEventListener('change', run);
+  run();
+})();
+</script>
+</body>
+</html>

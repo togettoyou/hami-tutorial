@@ -1,0 +1,1056 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · 打分与 Fit — HAMi 源码导读</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2316181d'/%3E%3Ctext x='16' y='23' font-size='17' font-family='monospace' font-weight='bold' fill='%23fff' text-anchor='middle'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<div class="layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main class="main">
+
+    <div class="page-kicker">第 05 章 · 第二阶段 一个 Pod 的旅程</div>
+    <h1 class="page-title">打分与 Fit：全项目最核心的算法</h1>
+    <p class="page-lede">
+      这是整个 HAMi 的心脏。<strong>两层打分</strong>（卡级 + 节点级）决定顺序，
+      <strong>Fit 的 14 道关卡</strong>决定每张卡能不能用。
+      这一章有三个互动模拟器，跑一遍比读十遍代码管用。
+    </p>
+
+    <div class="goals">
+      <h3>学完这章你应该能</h3>
+      <ul>
+        <li>手算一张卡的 <code>ComputeScore</code> 和一个节点的 <code>ComputeDefaultScore</code></li>
+        <li>解释 binpack 和 spread 在<strong>排序</strong>上到底差在哪一行代码</li>
+        <li>按顺序说出 NVIDIA <code>Fit()</code> 的主要筛选关卡，以及每关的失败原因常量</li>
+        <li>解释「InitContainer 峰值用量」为什么要用 DeepCopy + peakUsage 两套机制</li>
+        <li>拿到一条 <code>2/3 CardInsufficientMemory</code> 的 event，反推出用户该怎么改</li>
+      </ul>
+    </div>
+
+    <h2>1. 全局：两层打分，一层筛选</h2>
+
+    <div class="flow">
+      <div class="node">
+        <div class="h">calcScoreWithOptions<span class="tag">并发入口</span></div>
+        <div class="d">每个候选节点起一个 goroutine，并发打分</div>
+        <div class="src"><span data-srcref="pkg/scheduler/score.go:414"></span></div>
+      </div>
+      <div class="arrow">↓ 每个节点一个 goroutine</div>
+      <div class="node">
+        <div class="h">scoreNode<span class="tag">单节点</span></div>
+        <div class="d">DeepCopy 节点 → 算基础分 → 分配 Init 容器 → 分配普通容器 → 叠加后端加分</div>
+        <div class="src"><span data-srcref="pkg/scheduler/score.go:345"></span></div>
+      </div>
+      <div class="arrow">↓ 每个容器调一次</div>
+      <div class="node">
+        <div class="h">fitInDevices<span class="tag">单容器</span></div>
+        <div class="d">给每张卡打分 → <b>排序</b> → 调后端 Fit() → 成功则 AddResourceUsage 记账</div>
+        <div class="src"><span data-srcref="pkg/scheduler/score.go:86"></span></div>
+      </div>
+      <div class="arrow">↓ 委托给具体厂商</div>
+      <div class="node">
+        <div class="h">NvidiaGPUDevices.Fit<span class="tag">单请求 · 14 道关卡</span></div>
+        <div class="d">从后往前遍历排好序的卡，逐张过筛，凑够数量就返回</div>
+        <div class="src"><span data-srcref="pkg/device/nvidia/device.go:853"></span></div>
+      </div>
+    </div>
+
+    <h2>2. 第一层：卡级打分 ComputeScore</h2>
+
+    <p>
+      每张卡都会算一个分数，代表「如果把这个 Pod 放上去，这张卡会有多满」。
+      公式很简单，三个维度加权平均再乘 10：
+    </p>
+
+    <div class="codeblock" data-file="pkg/scheduler/policy/gpu_policy.go" data-start="194" data-lang="go" data-hl="2-5,7,10-12,14-19,23-26">
+<pre><code>func (ds *DeviceListsScore) ComputeScore(requests device.ContainerDeviceRequests, weights util.DeviceScoringWeights) {
+	if ds.Device == nil || ds.Device.Count == 0 || ds.Device.Totalcore == 0 || ds.Device.Totalmem == 0 {
+		ds.Score = 0
+		return
+	}
+	request, core, mem := int32(0), int32(0), int32(0)
+	// Here we are required to use the same type device
+	for _, container := range requests {
+
+		if container.Type != ds.Device.Type {
+			continue                                    // 只累加同类型设备的请求
+		}
+
+		request += 1
+		core += container.Coresreq
+		if container.MemPercentagereq != 0 &amp;&amp; container.MemPercentagereq != 101 {
+			mem += int32((int64(ds.Device.Totalmem) * int64(container.MemPercentagereq)) / 100)
+			continue                                    // 百分比 → 折算成绝对值
+		}
+		mem += container.Memreq
+	}
+	klog.V(2).Infof("device %s user %d, userCore %d, userMem %d,", ds.Device.ID, ds.Device.Used, ds.Device.Usedcores, ds.Device.Usedmem)
+
+	usedScore := float32(request+ds.Device.Used) / float32(ds.Device.Count)        // 份数占用率
+	coreScore := float32(core+ds.Device.Usedcores) / float32(ds.Device.Totalcore)  // 算力占用率
+	memScore  := float32(mem+ds.Device.Usedmem) / float32(ds.Device.Totalmem)      // 显存占用率
+	ds.Score = float32(util.Weight) * (float32(weights.Slot)*usedScore + float32(weights.Core)*coreScore + float32(weights.Memory)*memScore)
+	klog.V(2).Infof("device %s computer score is %f", ds.Device.ID, ds.Score)
+}</code></pre>
+    </div>
+
+    <div class="note">
+      <div class="t">拆开看这个公式</div>
+      <div class="codeblock" data-lang="text" data-title="卡分数公式">
+<pre><code>Score = 10 × ( w_slot × (已用份数+本次请求数)/总份数
+             + w_core × (已用算力+本次请求算力)/总算力
+             + w_mem  × (已用显存+本次请求显存)/总显存 )
+
+util.Weight = 10（pkg/util/types.go:104）
+默认权重 w_slot = w_core = w_mem = 1（DefaultDeviceScoringWeights）
+用户可以用 hami.io/device-scoring-weights 注解改</code></pre>
+      </div>
+      <p style="margin-bottom:0">
+        关键点：分数算的是「放上去之后」的占用率，不是「现在」的。
+        所以它能区分「放上去刚好塞满」和「放上去还剩一大半」。
+      </p>
+    </div>
+
+    <div class="lab">
+      <header>卡级打分计算器<span class="badge">互动</span></header>
+      <div class="body">
+        <div class="field-row">
+          <div><label class="f">总份数</label><input type="number" id="s_count" value="10"></div>
+          <div><label class="f">已用份数</label><input type="number" id="s_used" value="2"></div>
+          <div><label class="f">总显存</label><input type="number" id="s_tmem" value="32768"></div>
+          <div><label class="f">已用显存</label><input type="number" id="s_umem" value="8000"></div>
+          <div><label class="f">已用算力</label><input type="number" id="s_ucore" value="30"></div>
+        </div>
+        <div class="field-row">
+          <div><label class="f">请求显存</label><input type="number" id="s_rmem" value="3000"></div>
+          <div><label class="f">请求算力</label><input type="number" id="s_rcore" value="20"></div>
+          <div><label class="f">w_slot</label><input type="number" id="s_wslot" value="1"></div>
+          <div><label class="f">w_core</label><input type="number" id="s_wcore" value="1"></div>
+          <div><label class="f">w_mem</label><input type="number" id="s_wmem" value="1"></div>
+        </div>
+        <div class="out" id="scoreOut"></div>
+      </div>
+    </div>
+
+    <h2>3. 排序：binpack 和 spread 就差一个大于号</h2>
+
+    <p>
+      算完分数后，<code>fitInDevices</code> 会对整个设备列表<strong>排序</strong>，
+      然后 <code>Fit()</code> <strong>从后往前</strong>遍历。所以排序规则直接决定了「优先挑哪张卡」。
+    </p>
+
+    <div class="codeblock" data-file="pkg/scheduler/policy/gpu_policy.go" data-start="77" data-lang="go" data-hl="6-11,13-19,21-32,34-41">
+<pre><code>func (l DeviceUsageList) Less(i, j int) bool {
+	// Comma-separated policy: chain binpack/spread/numa as sort keys in the
+	// order the caller wrote them. mutex/topology-aware are filters applied
+	// in each device backend's Fit(), not sort keys, so they don't appear here.
+	// Bare "numa" also routes here: it's a chain token, not a legacy value.
+	if strings.Contains(l.Policy, ",") || l.Policy == util.GPUSchedulerPolicyNuma.String() {
+		return l.lessByChain(i, j)                      // 逗号分隔的复合策略
+	}
+
+	// Single policy value: unchanged behavior.
+	si, sj := l.DeviceLists[i].Score, l.DeviceLists[j].Score
+	ni, nj := l.DeviceLists[i].Device.Numa, l.DeviceLists[j].Device.Numa
+	binpack := l.Policy == util.GPUSchedulerPolicyBinpack.String()
+
+	// mutex: busy GPUs first, idle GPUs at tail so Fit picks idle ones.
+	if l.Policy == util.GPUSchedulerPolicyMutex.String() {
+		ui, uj := l.DeviceLists[i].Device.Used, l.DeviceLists[j].Device.Used
+		if ui != uj {
+			return ui &gt; uj                              // 忙的排前面 → 空闲的在末尾被优先选中
+		}
+		return ni &lt; nj
+	}
+
+	// numa-bind: keep NUMA groups contiguous for Fit's same-NUMA accumulation.
+	if l.NumaBind {
+		if binpack {
+			if ni == nj {
+				return si &lt; sj
+			}
+			return ni &gt; nj                              // NUMA 是主键，保证同 NUMA 的卡连续
+		}
+		// default policy is spread
+		if ni == nj {
+			return si &gt; sj
+		}
+		return ni &lt; nj
+	}
+
+	// score primary, NUMA tiebreaker (#1806).
+	if binpack {
+		if si != sj {
+			return si &lt; sj                              // binpack：分数低的排前，高的在末尾
+		}
+		return ni &lt; nj
+	}
+	// default policy is spread
+	if si != sj {
+		return si &gt; sj                                  // spread：分数高的排前，低的在末尾
+	}
+	return ni &lt; nj
+}</code></pre>
+    </div>
+
+    <div class="note">
+      <div class="t">「从后往前遍历」是理解排序的钥匙</div>
+      <div class="codeblock" data-lang="go" data-title="pkg/device/nvidia/device.go:865">
+<pre><code>for i := len(devices) - 1; i &gt;= 0; i-- {      // ← 倒着走！
+	dev := devices[i]
+	...
+}</code></pre>
+      </div>
+      <p style="margin-bottom:0">
+        所以 <strong>「排在末尾的卡最先被检查」</strong>。这就解释了所有排序规则：
+      </p>
+      <div class="tbl-wrap">
+      <table>
+        <tr><th style="width:130px">策略</th><th style="width:200px">排序（升序）</th><th>末尾是谁 = 优先选谁</th></tr>
+        <tr><td><b>binpack</b></td><td>分数 <b>低 → 高</b></td><td>分数最高 = <b>最满的卡</b>，把碎片塞满</td></tr>
+        <tr><td><b>spread</b></td><td>分数 <b>高 → 低</b></td><td>分数最低 = <b>最空的卡</b>，负载摊开</td></tr>
+        <tr><td><b>mutex</b></td><td>已用份数 <b>多 → 少</b></td><td>已用份数最少 = <b>全空闲的卡</b>，实现独占</td></tr>
+        <tr><td><b>numa-bind</b></td><td>NUMA 号为主键</td><td>保证同 NUMA 的卡在列表里<b>连续</b>，Fit 才能累积同 NUMA 的卡</td></tr>
+      </table>
+      </div>
+    </div>
+
+    <div class="note tip">
+      <div class="t">复合策略：<code>numa,binpack</code> 这样写</div>
+      <p style="margin-bottom:0">
+        新版本支持用逗号串联排序键，走 <code>lessByChain()</code>（<span data-srcref="pkg/scheduler/policy/gpu_policy.go:129"></span>）。
+        <code>mutex</code> 和 <code>topology-aware</code> <strong>不是排序键</strong>，
+        它们是在 <code>Fit()</code> 里通过 <code>util.PolicyContains</code> 生效的<strong>过滤器</strong>，
+        所以 <code>gpuSortKeyChain()</code> 会把它们丢掉。这个区分很容易搞混。
+      </p>
+    </div>
+
+    <h2>4. 第二层：节点级打分</h2>
+
+    <p>节点分数 = <strong>基础分</strong> + <strong>后端加分</strong>。基础分逻辑跟卡级几乎一样，只是把全节点的卡汇总：</p>
+
+    <div class="codeblock" data-file="pkg/scheduler/policy/node_policy.go" data-start="106" data-lang="go" data-hl="3-7,10-14,16-19,21-25">
+<pre><code>func (ns *NodeScore) ComputeDefaultScore(devices DeviceUsageList) {
+	used, usedCore, usedMem := int32(0), int32(0), int32(0)
+	for _, device := range devices.DeviceLists {
+		used += device.Device.Used
+		usedCore += device.Device.Usedcores
+		usedMem += device.Device.Usedmem
+	}
+	klog.V(2).Infof("node %s used %d, usedCore %d, usedMem %d,", ns.NodeID, used, usedCore, usedMem)
+
+	total, totalCore, totalMem := int32(0), int32(0), int32(0)
+	for _, deviceLists := range devices.DeviceLists {
+		total += deviceLists.Device.Count
+		totalCore += deviceLists.Device.Totalcore
+		totalMem += deviceLists.Device.Totalmem
+	}
+	if total == 0 || totalCore == 0 || totalMem == 0 {
+		ns.Score = 0
+		return
+	}
+	useScore := float32(used) / float32(total)
+	coreScore := float32(usedCore) / float32(totalCore)
+	memScore := float32(usedMem) / float32(totalMem)
+	ns.Score = float32(util.Weight) * (useScore + coreScore + memScore)
+	klog.V(2).Infof("node %s computer default score is %f", ns.NodeID, ns.Score)
+}</code></pre>
+    </div>
+
+    <div class="note warn">
+      <div class="t">节点基础分<b>不支持自定义权重</b></div>
+      <p style="margin-bottom:0">
+        对比一下：卡级 <code>ComputeScore</code> 有 <code>weights.Slot/Core/Memory</code>，
+        但节点级 <code>ComputeDefaultScore</code> 是<strong>硬编码的等权重</strong>。
+        <br><em>这算是一个不一致的地方。如果你想找一个「小而明确」的贡献点，
+        「让 <code>hami.io/device-scoring-weights</code> 也作用于节点打分」是个不错的候选 ——
+        但记得先开 issue 问社区这是不是有意为之。</em>
+      </p>
+    </div>
+
+    <p>然后是后端加分。这里用了一个空方法的标记接口：</p>
+
+    <div class="codeblock" data-file="pkg/scheduler/policy/node_policy.go" data-start="56" data-lang="go" data-hl="1-9,11,17-19,21-28">
+<pre><code>// policyNeutralScorer is an optional interface a device backend may implement to
+// declare that its ScoreNode result is policy-independent and follows a "higher
+// score is a better node" convention. Backends that implement it must not
+// inspect the scheduler policy inside ScoreNode; instead OverrideScore weights
+// the returned score and adapts it to the active scheduling policy (for example,
+// inverting it under the Spread policy). This keeps policy handling in one place
+// so new policies do not require backend-specific changes.
+type policyNeutralScorer interface {
+	PolicyNeutralScore()
+}
+
+func (ns *NodeScore) OverrideScore(previous []*device.DeviceUsage, policy string) {
+	devScore := float32(0)
+	for idx, val := range ns.Devices {
+		dev, ok := device.GetDevices()[idx]
+		if !ok || dev == nil {
+			klog.V(4).Infof("Skip scoring for device type %s: not registered", idx)
+			continue
+		}
+
+		score := dev.ScoreNode(ns.Node, val, previous, policy)
+
+		// Backends implementing policyNeutralScorer return policy-independent
+		// "higher is better" scores. For the Spread policy (which selects the
+		// lowest score), we invert the score to preserve the ranking.
+		// We also apply a weight of 10000 to ensure device scores dominate
+		// the base node score.
+		if _, ok := dev.(policyNeutralScorer); ok {
+			weight := float32(10000)
+			if policy == util.NodeSchedulerPolicySpread.String() {
+				weight = -10000                        // spread 下取反
+			}
+			score = weight * score
+		}
+
+		devScore += score
+	}
+	ns.Score += devScore
+	klog.V(2).Infof("node %s default score is %f, computer override score is %f", ns.NodeID, ns.Score-devScore, ns.Score)
+}</code></pre>
+    </div>
+
+    <div class="note tip">
+      <div class="t"><code>policyNeutralScorer</code>。标记接口的用法</div>
+      <p>
+        问题：不同后端的 <code>ScoreNode</code> 返回的分数，<strong>方向不一致</strong>。
+        有的是「越高越好」，而调度器在 spread 策略下要选<strong>最低分</strong>的节点。
+        如果每个后端自己判断策略，逻辑就散落各处了。
+      </p>
+      <p style="margin-bottom:0">
+        解法：定义一个<strong>空方法的标记接口</strong>。后端实现它，就表示「我返回的是策略无关的、越高越好的分数」，
+        剩下的策略适配（spread 时取反）由 <code>OverrideScore</code> <strong>统一处理</strong>。
+        <br>权重 10000 保证后端分数<strong>压倒</strong>基础分 —— 比如 NVLink 拓扑最优的组合，
+        无论基础分怎样都应该胜出。
+      </p>
+    </div>
+
+    <h2>5. Fit()：14 道关卡</h2>
+
+    <p>
+      终于到核心了。NVIDIA 的 <code>Fit()</code> 有 170 行，
+      但结构非常清晰：一个从后往前的循环，里面十几个 <code>continue</code>。
+      每个 <code>continue</code> 就是一道关卡。
+    </p>
+
+    <div class="lab">
+      <header>Fit 逐卡筛选模拟器<span class="badge">互动 · 本章重点</span></header>
+      <div class="body">
+        <p style="font-size:13.5px;color:var(--fg-soft);margin-bottom:12px">
+          调整请求和策略，看 4 张卡按什么顺序被检查、每张卡在哪一关被拒、最后选中谁。
+        </p>
+        <div class="field-row">
+          <div><label class="f">要几张卡</label><input type="number" id="f_nums" value="1" min="1" max="4"></div>
+          <div><label class="f">请求显存 MB</label><input type="number" id="f_mem" value="8000"></div>
+          <div><label class="f">请求算力 %</label><input type="number" id="f_core" value="30"></div>
+          <div style="flex:1 1 150px"><label class="f">选卡策略</label>
+            <select id="f_policy">
+              <option value="binpack">binpack（塞满）</option>
+              <option value="spread" selected>spread（摊开）</option>
+              <option value="mutex">mutex（独占空闲卡）</option>
+            </select>
+          </div>
+        </div>
+        <div class="field-row">
+          <div style="flex:1 1 180px"><label class="f">额外条件</label>
+            <select id="f_extra">
+              <option value="none">无</option>
+              <option value="cordon">GPU-2 被 cordon（hami.io/device-cordon）</option>
+              <option value="unhealthy">GPU-1 不健康</option>
+              <option value="type">Pod 指定 use-gputype=A100（只有 GPU-3 是 A100）</option>
+            </select>
+          </div>
+        </div>
+        <div class="out" id="fitOut"></div>
+      </div>
+    </div>
+
+    <h3>5.1 循环骨架</h3>
+
+    <div class="codeblock" data-file="pkg/device/nvidia/device.go" data-start="853" data-lang="go" data-hl="2-4,8-11,12,14">
+<pre><code>func (nv *NvidiaGPUDevices) Fit(devices []*device.DeviceUsage, request device.ContainerDeviceRequest, pod *corev1.Pod, nodeInfo *device.NodeInfo, allocated *device.PodDevices) (bool, map[string]device.ContainerDevices, string) {
+	k := request
+	originReq := k.Nums               // 原始请求数量，NUMA 重置时要用
+	prevnuma := -1                    // 上一张卡的 NUMA 号
+	klog.InfoS("Allocating device for container request", "pod", klog.KObj(pod), "card request", k)
+	var tmpDevs map[string]device.ContainerDevices
+	tmpDevs = make(map[string]device.ContainerDevices)
+	reason := make(map[string]int)    // 统计每种失败原因出现了几次
+	gpuPolicy := util.GetGPUSchedulerPolicyByPod(device.GPUSchedulerPolicy, pod)
+	needTopology := util.PolicyContains(gpuPolicy, util.GPUSchedulerPolicyTopology)
+	isMutex := util.PolicyContains(gpuPolicy, util.GPUSchedulerPolicyMutex)
+	cordoned := cordonedDevices(nodeInfo)
+
+	for i := len(devices) - 1; i &gt;= 0; i-- {        // 从后往前（排序末尾优先）
+		dev := devices[i]
+		...
+	}</code></pre>
+    </div>
+
+    <h3>5.2 十四道关卡逐条看</h3>
+
+    <div class="codeblock" data-file="pkg/device/nvidia/device.go" data-start="868" data-lang="go" data-hl="1-5,7-11,13-18,20-27,29-33">
+<pre><code>		if !dev.Health {                                                    // ① 健康
+			reason[common.CardNotHealth]++
+			klog.V(5).InfoS(common.CardNotHealth, ...)
+			continue
+		}
+		if _, isCordoned := cordoned[dev.ID]; isCordoned {                  // ② 是否被 cordon
+			reason[common.CardCordoned]++
+			klog.V(5).InfoS(common.CardCordoned, ...)
+			continue
+		}
+		found, numa := nv.checkType(pod.GetAnnotations(), *dev, k)          // ③ 型号匹配
+		if !found {
+			reason[common.CardTypeMismatch]++
+			klog.V(5).InfoS(common.CardTypeMismatch, ...)
+			continue
+		}
+		if numa &amp;&amp; prevnuma != dev.Numa {                                   // ④ NUMA 换组，重置累积
+			if k.Nums != originReq {
+				reason[common.NumaNotFit] += len(tmpDevs[k.Type])
+				klog.V(5).InfoS(common.NumaNotFit, ...)
+			}
+			k.Nums = originReq
+			prevnuma = dev.Numa
+			tmpDevs = make(map[string]device.ContainerDevices)              // ← 之前攒的卡全丢弃
+		}
+		if !device.CheckUUID(pod.GetAnnotations(), dev.ID, GPUUseUUID, GPUNoUseUUID, nv.CommonWord()) {
+			reason[common.CardUUIDMismatch]++                               // ⑤ UUID 白/黑名单
+			klog.V(5).InfoS(common.CardUUIDMismatch, ...)
+			continue
+		}</code></pre>
+    </div>
+
+    <div class="note trap">
+      <div class="t">第 ④ 关：NUMA 绑定的「攒卡」逻辑</div>
+      <p style="margin-bottom:0">
+        当 Pod 要求 <code>nvidia.com/numa-bind: true</code> 且要多张卡时，
+        这几张卡必须在<strong>同一个 NUMA 节点</strong>上。
+        实现方式依赖排序：因为排序保证了同 NUMA 的卡在列表里是连续的，
+        Fit 只要沿途累积，一旦发现 NUMA 号变了就清空重来。
+        <br>这就是为什么 <code>DeviceUsageList.Less()</code> 里在 <code>NumaBind</code> 时
+        要把 NUMA 号当<strong>主排序键</strong>。不连续的话这个算法就废了。
+      </p>
+    </div>
+
+    <div class="codeblock" data-file="pkg/device/nvidia/device.go" data-start="899" data-lang="go" data-hl="1-6,8-12,14-18,20-25,27-31">
+<pre><code>		memreq := int32(0)
+		if dev.Count &lt;= dev.Used {                                          // ⑥ 切分份数用完
+			reason[common.CardTimeSlicingExhausted]++
+			klog.V(5).InfoS(common.CardTimeSlicingExhausted, ...)
+			continue
+		}
+		if isMutex &amp;&amp; dev.Used &gt; 0 {                                        // ⑦ mutex 策略：只要空闲卡
+			reason[common.ExclusiveDeviceAllocateConflict]++
+			klog.V(5).InfoS(common.ExclusiveDeviceAllocateConflict, ...)
+			continue
+		}
+		if k.Coresreq &gt; 100 || k.Coresreq &lt; 0 {                             // ⑧ 算力参数范围
+			klog.ErrorS(nil, "core limit out of range (must be 0-100)", ...)
+			reason[common.CardInsufficientCore]++
+			continue
+		}
+		if k.Memreq &gt; 0 {
+			memreq = k.Memreq
+		}
+		if k.MemPercentagereq != 101 &amp;&amp; k.Memreq == 0 {                     // 百分比 → 绝对值
+			//This incurs an issue
+			memreq = dev.Totalmem * k.MemPercentagereq / 100
+		}
+		if !fitQuota(pod, tmpDevs, allocated, pod.Namespace, dev.ID, int64(memreq), int64(k.Coresreq)) {
+			reason[common.ResourceQuotaNotFit]++                             // ⑨ 命名空间配额
+			klog.V(3).InfoS(common.ResourceQuotaNotFit, ...)
+			continue
+		}
+		if dev.Totalmem-dev.Usedmem &lt; memreq {                              // ⑩ 显存不足 
+			reason[common.CardInsufficientMemory]++
+			klog.V(5).InfoS(common.CardInsufficientMemory, ...)
+			continue
+		}
+		if dev.Totalcore-dev.Usedcores &lt; k.Coresreq {                       // ⑪ 算力不足 
+			reason[common.CardInsufficientCore]++
+			klog.V(5).InfoS(common.CardInsufficientCore, ...)
+			continue
+		}</code></pre>
+    </div>
+
+    <div class="note warn">
+      <div class="t">注意 ⑩ 前面那句注释：<code>//This incurs an issue</code></div>
+      <p style="margin-bottom:0">
+        百分比转绝对值 <code>memreq = dev.Totalmem * k.MemPercentagereq / 100</code>
+        是<strong>按每张卡各自的总显存</strong>算的。
+        节点上如果混插了不同型号的卡（比如 V100 32G 和 A100 80G），
+        「要 50% 显存」在两张卡上意味着完全不同的绝对值 ——
+        这会让打分和实际分配对不上。开发者自己都标了 TODO 性质的注释。
+        <br><em>这是一个真实存在的已知问题，可以顺着它去 GitHub 搜相关 issue。</em>
+      </p>
+    </div>
+
+    <div class="codeblock" data-file="pkg/device/nvidia/device.go" data-start="937" data-lang="go" data-hl="1-6,8-13,15-31">
+<pre><code>		// Coresreq=100 indicates it want this card exclusively
+		if dev.Totalcore == 100 &amp;&amp; k.Coresreq == 100 &amp;&amp; dev.Used &gt; 0 {      // ⑫ 独占请求但卡已被占
+			reason[common.ExclusiveDeviceAllocateConflict]++
+			klog.V(5).InfoS(common.ExclusiveDeviceAllocateConflict, ...)
+			continue
+		}
+		// You can't allocate core=0 job to an already full GPU
+		if dev.Totalcore != 0 &amp;&amp; dev.Usedcores == dev.Totalcore &amp;&amp; k.Coresreq == 0 {  // ⑬ 算力已满
+			reason[common.CardComputeUnitsExhausted]++
+			klog.V(5).InfoS(common.CardComputeUnitsExhausted, ...)
+			continue
+		}
+		// CustomFilterRule must see the resolved memory request, not the raw (possibly zero) Memreq field.
+		resolvedReq := request
+		resolvedReq.Memreq = memreq
+		if !nv.CustomFilterRule(allocated, resolvedReq, tmpDevs[k.Type], dev) {  // ⑭ 自定义规则（MIG）
+			// In MIG mode, CustomFilterRule rejects when the requested memory
+			// does not fit an allowed profile with a free placement on this
+			// device. Surface this as a distinct reason so users can tell
+			// placement infeasibility apart from generic filter failure.
+			if dev.Mode == MigMode {
+				reason[common.CardMigTopologyInfeasible]++
+				klog.V(5).InfoS(common.CardMigTopologyInfeasible, ...)
+				continue
+			}
+			reason[common.CardNotFoundCustomFilterRule]++
+			klog.V(5).InfoS(common.CardNotFoundCustomFilterRule, ...)
+			continue
+		}</code></pre>
+    </div>
+
+    <div class="note tip">
+      <div class="t">⑫ 和 ⑬ 是一对镜像规则</div>
+      <ul style="margin-bottom:0">
+        <li><b>⑫</b>：我要独占（<code>Coresreq=100</code>），但卡上已经有别人 → 不行。</li>
+        <li><b>⑬</b>：我不限制算力（<code>Coresreq=0</code>，意思是「随便用」），
+            但卡的算力已经<strong>被别人全部预定完了</strong>（<code>Usedcores == Totalcore</code>）→ 也不行。</li>
+      </ul>
+    </div>
+
+    <h3>5.3 收尾：凑够数量就返回</h3>
+
+    <div class="codeblock" data-file="pkg/device/nvidia/device.go" data-start="967" data-lang="go" data-hl="1-3,5-11,13-17,19-21">
+<pre><code>		if k.Nums &gt; 0 {
+			klog.V(5).InfoS("find fit device", "pod", klog.KObj(pod), "device", dev.ID)
+			if !needTopology {
+				k.Nums--                                       // 拓扑模式下不减，要先收集所有候选
+			}
+			tmpDevs[k.Type] = append(tmpDevs[k.Type], device.ContainerDevice{
+				Idx:       int(dev.Index),
+				UUID:      dev.ID,
+				Type:      k.Type,
+				Usedmem:   memreq,
+				Usedcores: k.Coresreq,
+			})
+		}
+		if k.Nums == 0 &amp;&amp; !needTopology {                      // 凑够了，收工
+			klog.V(4).InfoS("device allocate success", "pod", klog.KObj(pod), "allocate device", tmpDevs)
+			recordMigPlans(devices, tmpDevs[k.Type])
+			return true, tmpDevs, ""
+		}
+		if dev.Mode == "mig" {
+			i++                                                 // MIG 模式：同一张卡可能被重复检查
+		}
+	}</code></pre>
+    </div>
+
+    <div class="note trap">
+      <div class="t">那个诡异的 <code>i++</code></div>
+      <p style="margin-bottom:0">
+        循环体末尾的 <code>if dev.Mode == "mig" { i++ }</code>，配合 <code>for i--</code>，
+        效果是「这一轮不前进，重新检查同一张卡」。
+        因为一张 MIG 卡可以切出多个实例，一个容器可能在同一张物理卡上拿到多个 MIG 实例。
+        <br>这是全函数最难读的一行，第 10 章会详细展开 MIG。
+      </p>
+    </div>
+
+    <p>循环走完还没凑够，就是失败：</p>
+
+    <div class="codeblock" data-file="pkg/device/nvidia/device.go" data-start="1018" data-lang="go" data-hl="1-4,6">
+<pre><code>	if len(tmpDevs[k.Type]) &gt; 0 {
+		reason[common.AllocatedCardsInsufficientRequest] = len(tmpDevs[k.Type])
+		klog.V(5).InfoS(common.AllocatedCardsInsufficientRequest, "pod", klog.KObj(pod), "request", originReq, "allocated", len(tmpDevs[k.Type]))
+	}
+	return false, tmpDevs, common.GenReason(reason, len(devices))    // ← 生成 "2/4 CardInsufficientMemory"
+}</code></pre>
+    </div>
+
+    <h2>6. 记账：AddResourceUsage</h2>
+
+    <p>
+      <code>Fit()</code> 只产出<strong>方案</strong>，不改用量。真正扣减在
+      <code>fitInDevices</code> 里调 <code>AddResourceUsage</code>：
+    </p>
+
+    <div class="codeblock" data-file="pkg/scheduler/score.go" data-start="118" data-lang="go" data-hl="1-2,4-14,16-18,20-21,24">
+<pre><code>		// Note: need idx to pass &amp;tmpDevs[k.Type][idx] to AddResourceUsage
+		for idx, val := range tmpDevs[k.Type] {
+			targetIdx := -1
+			for nidx, v := range node.Devices.DeviceLists {
+				if v.Device.ID == val.UUID {              // 按 UUID 找回节点上那张卡
+					targetIdx = nidx
+					break
+				}
+			}
+			if targetIdx == -1 {
+				errMsg := fmt.Sprintf("Device with UUID %q not found on node %s after Fit", val.UUID, node.Node.Name)
+				klog.ErrorS(nil, errMsg, "pod", klog.KObj(pod))
+				return false, errMsg
+			}
+			d := node.Devices.DeviceLists[targetIdx].Device
+
+			if err := devPlugin.AddResourceUsage(pod, d, &amp;tmpDevs[k.Type][idx]); err != nil {
+				klog.Errorf("AddResourceUsage failed for device %s: %v", d.ID, err)
+				return false, fmt.Sprintf("AddResourceUsage failed for device %s: %v", d.ID, err)
+			}
+			klog.V(5).Infof("Allocated device %s: used=%d, cores=%d, mem=%d",
+				d.ID, d.Used, d.Usedcores, d.Usedmem)
+		}
+
+		(*devinput)[k.Type] = append((*devinput)[k.Type], tmpDevs[k.Type])</code></pre>
+    </div>
+
+    <div class="codeblock" data-file="pkg/device/nvidia/device.go" data-start="779" data-lang="go" data-hl="2-19,20-22">
+<pre><code>func (dev *NvidiaGPUDevices) AddResourceUsage(pod *corev1.Pod, n *device.DeviceUsage, ctr *device.ContainerDevice) error {
+	if n.Mode == MigMode {
+		// MIG 模式：还要挑一个 profile + placement，并回写到 ctr（第 10 章）
+		occupied := occupiedMigPlacements(n.MigAllocationsInUse)
+		profile, placement, ok := plannedMigAllocation(n.MigProfiles, occupied, ctr)
+		if !ok {
+			profile, placement, ok = selectMigCandidate(n.MigProfiles, occupied, ctr.Usedmem)
+		}
+		if !ok {
+			return errors.New("MIG profile and placement allocation failed")
+		}
+		ctr.Usedmem = profile.MemoryMB          // ← 注意：会覆盖用户请求值！
+		ctr.Usedcores = profile.Core
+		...
+		n.MigAllocationsInUse = append(n.MigAllocationsInUse, device.MigAllocation{Profile: profile.Name, Placement: placement})
+	}
+	n.Used++                                     // 三行记账
+	n.Usedcores += ctr.Usedcores
+	n.Usedmem += ctr.Usedmem
+	return nil
+}</code></pre>
+    </div>
+
+    <h2>7. InitContainer 的峰值用量：一个精妙的双机制</h2>
+
+    <p>
+      第 03 章讲配额时提过：InitContainer 是<strong>串行</strong>的，
+      所以它们的资源应该<strong>取最大值</strong>而不是累加。
+      但调度时还有个额外要求：要保证每个 InitContainer 单独看都能放下。
+    </p>
+
+    <div class="note analogy">
+      <div class="t">话剧的舞台调度</div>
+      <p style="margin-bottom:0">
+        三个 InitContainer 像三幕戏，<strong>轮流上台</strong>，同一时刻只有一幕在演。<br>
+        <b>要求 1</b>：每一幕单独都要放得下舞台（各自 Fit 检查）。<br>
+        <b>要求 2</b>：最终占用要按「最费空间的那一幕」算，而不是三幕加起来。<br>
+        <b>例外</b>：Sidecar 是<strong>一直待在台上的道具</strong>，它跟每一幕都同时存在，所以要累加。
+      </p>
+    </div>
+
+    <div class="codeblock" data-file="pkg/scheduler/score.go" data-start="267" data-lang="go" data-hl="9-14,16-24,26-33">
+<pre><code>func allocateInitContainers(appNodeCopy *NodeUsage, nodeID string, resourceReqs device.PodDeviceRequests, task *corev1.Pod, nodeInfo *device.NodeInfo, allocTypes map[string]struct{}, sidecarIdx map[int]struct{}, numInitContainers int, peakUsage map[string]peakUsageSnapshot, weights util.DeviceScoringWeights) (device.PodDevices, bool, string) {
+	initAllocs := make(device.PodDevices)
+
+	for i, req := range resourceReqs {
+		if i &gt;= numInitContainers {
+			break
+		}
+		if len(req) == 0 {
+			for typ := range allocTypes {
+				initAllocs[typ] = append(initAllocs[typ], device.ContainerDevices{})   // 占位
+			}
+			continue
+		}
+		if _, isSidecar := sidecarIdx[i]; isSidecar {
+			// Sidecar：一直活着 → 直接在共享副本上扣，累积效果
+			fit, reason := fitInDevices(appNodeCopy, req, task, nodeInfo, &amp;initAllocs, weights)
+			if !fit {
+				klog.V(4).InfoS("Sidecar container does not fit", ...)
+				return nil, false, reason
+			}
+			updatePeakUsage(peakUsage, appNodeCopy)
+		} else {
+			// 普通 Init：在一次性副本上试算 → 用完丢弃，不影响下一个
+			nodeCopy := appNodeCopy.DeepCopy()                                        // 关键
+			fit, reason := fitInDevices(nodeCopy, req, task, nodeInfo, &amp;initAllocs, weights)
+			if !fit {
+				klog.V(4).InfoS("Init container does not fit", ...)
+				return nil, false, reason
+			}
+			updatePeakUsage(peakUsage, nodeCopy)                                      // 但记录峰值
+		}
+		...
+	}
+	return initAllocs, true, ""
+}</code></pre>
+    </div>
+
+    <div class="note">
+      <div class="t">两套机制配合</div>
+      <div class="tbl-wrap">
+      <table>
+        <tr><th style="width:150px">机制</th><th>作用</th></tr>
+        <tr><td><b>DeepCopy 一次性副本</b></td><td>让每个普通 InitContainer 都从「Sidecar 已占用」的基线开始试算，<br><b>互不影响</b>。因为它们不同时存在</td></tr>
+        <tr><td><b>peakUsage 快照</b></td><td>记录整个过程中每张卡出现过的<b>最高用量</b>，<br>最后用 <code>applyPeakUsage</code> 写回真实节点</td></tr>
+      </table>
+      </div>
+      <p style="margin-bottom:0">
+        最后一步 <code>applyPeakUsage</code>（<span data-srcref="pkg/scheduler/score.go:208"></span>）
+        取 <code>max(普通容器分配后的用量, init 阶段的峰值)</code>，
+        跟第 03 章配额检查的公式<strong>完全对应</strong>。
+      </p>
+    </div>
+
+    <h2>8. 并发打分</h2>
+
+    <div class="codeblock" data-file="pkg/scheduler/score.go" data-start="426" data-lang="go" data-hl="1-6,8-11,13-16,18-25,27-31,33-34">
+<pre><code>	wg := sync.WaitGroup{}
+	fitNodesMutex := sync.Mutex{}
+	failedNodesMutex := sync.Mutex{}
+	failureReason := make(map[string][]string)
+	errCh := make(chan error, len(*nodes))
+
+	for nodeID, node := range *nodes {
+		wg.Add(1)
+		go func(nodeID string, node *NodeUsage) {         // 每个节点一个 goroutine
+			defer wg.Done()
+
+			result := s.scoreNode(nodeID, node, resourceReqs, task, userNodePolicy, deviceScoringWeights)
+
+			switch {
+			case result.err != nil:
+				failedNodesMutex.Lock()
+				failedNodes[nodeID] = result.reason
+				failedNodesMutex.Unlock()
+				errCh &lt;- result.err
+
+			case result.score == nil:                     // 不 fit，但不是错误
+				failedNodesMutex.Lock()
+				failedNodes[nodeID] = result.reason
+				for reasonType := range common.ParseReason(result.reason) {
+					failureReason[reasonType] = append(failureReason[reasonType], nodeID)
+				}
+				failedNodesMutex.Unlock()
+
+			default:
+				fitNodesMutex.Lock()
+				res.NodeList = append(res.NodeList, result.score)
+				fitNodesMutex.Unlock()
+			}
+		}(nodeID, node)
+	}
+	wg.Wait()
+	close(errCh)</code></pre>
+    </div>
+
+    <div class="note trap">
+      <div class="t">并发安全的前提：每个节点数据独立</div>
+      <p style="margin-bottom:0">
+        这些 goroutine 敢并发跑，是因为 <code>scoreNode</code> 一进去就
+        <code>appNodeCopy := node.DeepCopy()</code>（<span data-srcref="pkg/scheduler/score.go:364"></span>），
+        每个节点操作自己的副本。
+        <br>如果哪天有人在 scoreNode 里加了对全局状态的写入，这里就会炸。
+        项目专门有 <code>-race</code> 的 CI 就是防这个。
+        <br>注意 <code>failureReason</code> 这个 map 是<strong>共享的</strong>，
+        所以写它必须持 <code>failedNodesMutex</code>。代码里做对了。
+      </p>
+    </div>
+
+    <h2>9. 动手实验</h2>
+
+    <ol class="steps">
+      <li>
+        <span class="st">跑 Fit 的完整测试，感受用例规模</span>
+        <div class="codeblock" data-lang="bash"><pre><code>go test ./pkg/device/nvidia/ -run TestDevices_Fit -v -count=1 2>&amp;1 | grep -E "^(=== RUN|--- (PASS|FAIL))" | head -40</code></pre></div>
+      </li>
+      <li>
+        <span class="st">改一个用例，验证你对某道关卡的理解</span>
+        <p>打开 <code>pkg/device/nvidia/device_test.go</code> 第 826 行开始的 <code>TestDevices_Fit</code>，
+           找一个「显存刚好够」的用例，把 <code>Usedmem</code> 加 1，看是不是变成
+           <code>CardInsufficientMemory</code>。</p>
+      </li>
+      <li>
+        <span class="st">验证排序方向</span>
+        <div class="codeblock" data-lang="bash"><pre><code>go test ./pkg/scheduler/policy/ -run TestGPUPolicy -v -count=1
+sed -n '1,120p' pkg/scheduler/policy/gpu_policy_test.go   # 742 行，全是排序用例</code></pre></div>
+      </li>
+      <li>
+        <span class="st">打开 V5 日志，看 Fit 逐卡拒绝的过程</span>
+        <div class="codeblock" data-lang="bash"><pre><code>go test ./pkg/device/nvidia/ -run TestDevices_Fit -count=1 -args -v=5 2>&amp;1 | grep -i "reason\|card" | head -30</code></pre></div>
+      </li>
+      <li>
+        <span class="st">跑打分的 benchmark</span>
+        <div class="codeblock" data-lang="bash"><pre><code>go test ./pkg/scheduler/ -run XXX -bench=. -benchmem -count=1
+# 看看节点数 / 卡数增长时，耗时和分配次数怎么变</code></pre></div>
+      </li>
+      <li>
+        <span class="st">看所有失败原因常量</span>
+        <div class="codeblock" data-lang="bash"><pre><code>cat pkg/device/common/common.go</code></pre></div>
+      </li>
+    </ol>
+
+    <h2>10. 本章自测</h2>
+
+    <div class="quiz" data-answer="B">
+      <div class="q">在 <b>binpack</b> 策略下，<code>DeviceUsageList.Less()</code> 返回 <code>score[i] &lt; score[j]</code>（升序），而 <code>Fit()</code> 从后往前遍历。最先被检查的是哪张卡？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>最空闲的卡（分数最低）</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>最满的卡（分数最高）</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>NUMA 号最小的卡</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>索引最小的卡</span></div>
+      <div class="expl">
+        升序排列 → 分数最高的在<strong>末尾</strong> → 从后往前遍历 → <strong>最先检查分数最高的</strong>。
+        分数代表「放上去之后有多满」，binpack 的目标就是优先把已经用了一部分的卡填满，
+        留出完整的空卡给需要整卡的任务。
+        <br>这两个设计（排序方向 + 倒序遍历）必须一起看才能理解，单看任何一个都会得出相反的结论。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="C">
+      <div class="q">一个 Pod 有 2 个普通 InitContainer（各要 8000MB）和 1 个普通容器（要 3000MB）。调度器最终会在卡上记多少显存？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>19000（全部累加）</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>3000（只算普通容器）</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>8000（init 峰值和普通容器取最大）</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>11000（一个 init + 普通容器）</span></div>
+      <div class="expl">
+        两个普通 InitContainer 串行执行，各自在 <code>DeepCopy</code> 的一次性副本上试算，
+        <code>peakUsage</code> 记录到的峰值是 <b>8000</b>（不是 16000，因为它们不同时存在）。
+        普通容器占 3000。最后 <code>applyPeakUsage</code> 取 <code>max(3000, 8000) = 8000</code>。
+        <br>注意：两个 InitContainer 各自都必须单独能放下 8000，
+        这是「每个 init 都跑一次 fitInDevices」保证的。
+        如果其中一个要 40000MB 而卡只有 32768，整个节点会被判 unfit。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="A">
+      <div class="q">Pod 设了 <code>nvidia.com/numa-bind: true</code> 要 2 张卡。节点上排序后的卡是 <code>[numa0-A, numa0-B, numa1-C, numa1-D]</code>（倒序遍历，即先 D 后 A）。会选中哪两张？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>D 和 C（都在 numa1）</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>D 和 A（分数最优的两张）</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>A 和 B（numa0 优先）</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>失败，因为跨 NUMA</span></div>
+      <div class="expl">
+        倒序遍历先看 D（numa1），<code>prevnuma</code> 从 -1 变成 1，攒下 D；
+        再看 C（numa1），NUMA 没变，继续攒 → 凑够 2 张，<strong>立刻返回</strong>。
+        <br>如果需要 3 张，走到 B（numa0）时 <code>numa &amp;&amp; prevnuma != dev.Numa</code> 成立，
+        <strong>把攒的 D、C 全部丢弃</strong>（<code>tmpDevs = make(...)</code>），
+        从 numa0 重新开始攒 B、A —— 但只有 2 张，最终失败并报 <code>NumaNotFit</code>。
+        <br>这个算法能工作的前提是排序保证同 NUMA 的卡连续。
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="D">
+      <div class="q">为什么 <code>policyNeutralScorer</code> 被设计成一个空方法的「标记接口」？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>Go 语言要求接口至少有一个方法</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>为了让后端能返回多个分数</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>为了性能，避免反射</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>让后端声明「我的分数是策略无关的」，把策略适配逻辑集中到 OverrideScore 一处</span></div>
+      <div class="expl">
+        看代码里那段注释：实现这个接口的后端不许在 ScoreNode 里检查调度策略，
+        只管返回「越高越好」的分数；<code>OverrideScore</code> 统一负责在 spread 策略下取反。
+        <br>好处：<strong>加新策略时只改一个地方</strong>，不用挨个改 12 个后端。
+        这是「把变化点收敛到单点」的经典做法，
+      </div>
+    </div>
+
+    <div class="quiz" data-answer="B">
+      <div class="q">用户看到 event <code>2 nodes CardInsufficientMemory(node-1,node-3)</code>。他应该怎么办？</div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>重启 HAMi 调度器</span></div>
+      <div class="opt" data-k="B"><span class="k">B</span><span>降低 <code>nvidia.com/gpumem</code> 的值，或者等其他 Pod 释放，或者加机器</span></div>
+      <div class="opt" data-k="C"><span class="k">C</span><span>把 schedulerName 改回 default-scheduler</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span>给 Pod 加 <code>nvidia.com/use-gputype</code> 注解</span></div>
+      <div class="expl">
+        这条消息来自 Fit 的第 ⑩ 关：
+        <code>dev.Totalmem - dev.Usedmem &lt; memreq</code>，
+        即两个节点上<strong>每一张卡的剩余显存都不够</strong>。
+        <br>排查顺序：先 <code>kubectl describe node</code> 看
+        <code>hami.io/node-nvidia-register</code> 确认卡的总显存；
+        再看那个节点上已经跑了哪些 GPU Pod。
+        <br>D 反而会让候选卡更少，更难调度上去。
+      </div>
+    </div>
+
+    <h2>11. 小结</h2>
+
+    <ul>
+      <li><b>两层打分</b>：卡级 <code>ComputeScore</code>（决定选哪张卡）+ 节点级 <code>ComputeDefaultScore</code> + <code>OverrideScore</code>（决定选哪个节点）。</li>
+      <li>分数含义是<b>「放上去之后有多满」</b>，binpack 选最满、spread 选最空、mutex 选全空。</li>
+      <li><b>排序方向 + 倒序遍历</b>必须一起看，单看一个会得出相反结论。</li>
+      <li>Fit 的 14 道关卡里，最常触发的是 ⑥ 份数用完、⑩ 显存不足、⑪ 算力不足。</li>
+      <li>NUMA 绑定靠「排序保证连续 + 换组就清空重来」实现。</li>
+      <li>InitContainer 用 DeepCopy 一次性副本（互不影响）+ peakUsage 快照（记峰值）双机制。</li>
+      <li>并发打分安全的前提是 scoreNode 一进去就 DeepCopy，改这块代码要格外小心。</li>
+    </ul>
+
+    <p class="next-hint">节点和卡都选好了，注解也写进去了。但还没真正绑定 ——
+        下一章讲 <strong>Bind</strong>：怎么用节点锁防止并发超卖，
+        以及任何一步失败时怎么做<strong>完整回滚</strong>。</p>
+
+    <div class="chapter-nav" id="chapterNav"></div>
+  </main>
+</div>
+
+<script src="../assets/js/site.js"></script>
+<script>
+/* ========== 实验室 1：卡级打分计算器 ========== */
+(function () {
+  const ids = ['s_count','s_used','s_tmem','s_umem','s_ucore','s_rmem','s_rcore','s_wslot','s_wcore','s_wmem'];
+  const out = document.getElementById('scoreOut');
+  function render() {
+    const v = {};
+    ids.forEach(i => v[i] = parseFloat(document.getElementById(i).value) || 0);
+    const usedScore = (1 + v.s_used) / (v.s_count || 1);
+    const coreScore = (v.s_rcore + v.s_ucore) / 100;
+    const memScore  = (v.s_rmem + v.s_umem) / (v.s_tmem || 1);
+    const score = 10 * (v.s_wslot * usedScore + v.s_wcore * coreScore + v.s_wmem * memScore);
+    const f = n => n.toFixed(4);
+    out.innerHTML =
+`<span class="key">usedScore</span> = (请求数 1 + 已用 ${v.s_used}) / 总份数 ${v.s_count}         = <span class="ok">${f(usedScore)}</span>
+<span class="key">coreScore</span> = (请求 ${v.s_rcore} + 已用 ${v.s_ucore}) / 总算力 100        = <span class="ok">${f(coreScore)}</span>
+<span class="key">memScore </span> = (请求 ${v.s_rmem} + 已用 ${v.s_umem}) / 总显存 ${v.s_tmem}  = <span class="ok">${f(memScore)}</span>
+
+Score = 10 × (${v.s_wslot}×${f(usedScore)} + ${v.s_wcore}×${f(coreScore)} + ${v.s_wmem}×${f(memScore)})
+      = <span class="ok" style="font-size:15px">${score.toFixed(4)}</span>
+
+<span class="dim">分数越高 = 放上去之后这张卡越满
+  binpack 会优先挑分数<b>最高</b>的（把碎片填满）
+  spread  会优先挑分数<b>最低</b>的（负载摊开）</span>
+
+<span class="dim">改 w_slot / w_core / w_mem 相当于给 Pod 加注解：
+  hami.io/device-scoring-weights: "slot=${v.s_wslot},core=${v.s_wcore},memory=${v.s_wmem}"
+例如只关心显存碎片，就把 slot 和 core 设为 0。</span>`;
+  }
+  ids.forEach(i => document.getElementById(i).addEventListener('input', render));
+  render();
+})();
+
+/* ========== 实验室 2：Fit 逐卡筛选模拟器 ========== */
+(function () {
+  const BASE = [
+    { id: 'GPU-0', idx: 0, type: 'NVIDIA-A100-40GB', numa: 0, total: 40960, used: 0,  umem: 0,     ucore: 0,  count: 10, health: true },
+    { id: 'GPU-1', idx: 1, type: 'NVIDIA-A100-40GB', numa: 0, total: 40960, used: 3,  umem: 24000, ucore: 60, count: 10, health: true },
+    { id: 'GPU-2', idx: 2, type: 'NVIDIA-V100-32GB', numa: 1, total: 32768, used: 1,  umem: 4000,  ucore: 10, count: 10, health: true },
+    { id: 'GPU-3', idx: 3, type: 'NVIDIA-A100-40GB', numa: 1, total: 40960, used: 8,  umem: 36000, ucore: 90, count: 10, health: true },
+  ];
+  const out = document.getElementById('fitOut');
+  const el = id => document.getElementById(id);
+
+  function run() {
+    const nums   = Math.max(1, parseInt(el('f_nums').value, 10) || 1);
+    const reqMem = parseInt(el('f_mem').value, 10) || 0;
+    const reqCore= parseInt(el('f_core').value, 10) || 0;
+    const policy = el('f_policy').value;
+    const extra  = el('f_extra').value;
+
+    const devs = BASE.map(d => ({ ...d }));
+    if (extra === 'unhealthy') devs[1].health = false;
+    const cordoned = extra === 'cordon' ? { 'GPU-2': 1 } : {};
+    const wantType = extra === 'type' ? 'A100' : null;
+
+    // ① 打分
+    devs.forEach(d => {
+      const usedScore = (1 + d.used) / d.count;
+      const coreScore = (reqCore + d.ucore) / 100;
+      const memScore  = (reqMem + d.umem) / d.total;
+      d.score = 10 * (usedScore + coreScore + memScore);
+    });
+
+    // ② 排序（升序），复刻 DeviceUsageList.Less
+    const sorted = devs.slice().sort((a, b) => {
+      if (policy === 'mutex') {
+        if (a.used !== b.used) return b.used - a.used;   // 忙的在前
+        return a.numa - b.numa;
+      }
+      if (policy === 'binpack') {
+        if (a.score !== b.score) return a.score - b.score;
+        return a.numa - b.numa;
+      }
+      if (a.score !== b.score) return b.score - a.score; // spread
+      return a.numa - b.numa;
+    });
+
+    let html = `<span class="key">① ComputeScore — 给每张卡打分</span>\n`;
+    devs.forEach(d => { html += `   ${d.id}  score = <span class="ok">${d.score.toFixed(3)}</span>   <span class="dim">(已用 ${d.umem}/${d.total}MB, ${d.ucore}/100%, ${d.used}/${d.count}份)</span>\n`; });
+
+    html += `\n<span class="key">② sort.Sort(node.Devices) — 策略：${policy}</span>\n`;
+    html += `   排序后（升序）：${sorted.map(d => d.id).join('  →  ')}\n`;
+    html += `   <span class="warn">Fit 从后往前遍历，所以检查顺序是：${sorted.slice().reverse().map(d => d.id).join('  →  ')}</span>\n`;
+
+    html += `\n<span class="key">③ Fit() 逐卡过筛（需要 ${nums} 张，每张 ${reqMem}MB / ${reqCore}%）</span>\n`;
+
+    const picked = [];
+    const reasons = {};
+    let remaining = nums;
+    for (let i = sorted.length - 1; i >= 0; i--) {
+      const d = sorted[i];
+      let rej = null;
+      if (!d.health)                                   rej = ['①', 'CardNotHealth', '卡不健康'];
+      else if (cordoned[d.id])                         rej = ['②', 'CardCordoned', '被 hami.io/device-cordon 排除'];
+      else if (wantType && !d.type.includes(wantType)) rej = ['③', 'CardTypeMismatch', `型号 ${d.type} 不含 "${wantType}"`];
+      else if (d.count <= d.used)                      rej = ['⑥', 'CardTimeSlicingExhausted', `切分份数用完 ${d.used}/${d.count}`];
+      else if (policy === 'mutex' && d.used > 0)       rej = ['⑦', 'ExclusiveDeviceAllocateConflict', `mutex 策略要求空闲卡，但已用 ${d.used} 份`];
+      else if (d.total - d.umem < reqMem)              rej = ['⑩', 'CardInsufficientMemory', `剩余 ${d.total - d.umem}MB < 需要 ${reqMem}MB`];
+      else if (100 - d.ucore < reqCore)                rej = ['⑪', 'CardInsufficientCore', `剩余 ${100 - d.ucore}% < 需要 ${reqCore}%`];
+      else if (reqCore === 100 && d.used > 0)          rej = ['⑫', 'ExclusiveDeviceAllocateConflict', '请求独占但卡上已有其他任务'];
+      else if (d.ucore === 100 && reqCore === 0)       rej = ['⑬', 'CardComputeUnitsExhausted', '算力已被预定完，不能再放 core=0 的任务'];
+
+      const memPct = d.umem / d.total * 100;
+      const newPct = rej ? 0 : Math.min(100 - memPct, reqMem / d.total * 100);
+
+      if (rej) {
+        reasons[rej[1]] = (reasons[rej[1]] || 0) + 1;
+        html += `
+<div class="devbar rejected">
+  <div class="top"><span>${d.id} <span style="color:var(--fg-mute)">${d.type} numa${d.numa}</span></span><span>score ${d.score.toFixed(2)}</span></div>
+  <div class="track"><i class="used" style="width:${memPct}%"></i></div>
+  <div class="why">✗ 第 ${rej[0]} 关 ${rej[1]} — ${rej[2]}</div>
+</div>`;
+      } else if (remaining > 0) {
+        remaining--;
+        picked.push(d.id);
+        html += `
+<div class="devbar">
+  <div class="top"><span>${d.id} <span style="color:var(--fg-mute)">${d.type} numa${d.numa}</span></span><span>score ${d.score.toFixed(2)}</span></div>
+  <div class="track"><i class="used" style="width:${memPct}%"></i><i class="new" style="width:${newPct}%"></i></div>
+  <div class="why pass">✓ 全部通过 → 选中！还需 ${remaining} 张 ${remaining === 0 ? '（够了，立刻 return）' : ''}</div>
+</div>`;
+        if (remaining === 0) {
+          html += `\n<span class="dim">   剩下的卡不再检查，Fit 直接返回。</span>\n`;
+          break;
+        }
+      }
+    }
+
+    html += `\n<span class="key">④ 结果</span>\n`;
+    if (remaining === 0) {
+      html += `   <span class="ok">✓ Fit 成功 → tmpDevs = [${picked.join(', ')}]</span>\n`;
+      html += `   <span class="dim">接着 fitInDevices 会对每张卡调 AddResourceUsage 记账：\n`;
+      html += `     Used++ ; Usedmem += ${reqMem} ; Usedcores += ${reqCore}</span>\n`;
+      html += `   <span class="dim">最终编码进 Pod 注解：${picked.map(p => `${p},NVIDIA,${reqMem},${reqCore}`).join(':')}:;</span>`;
+    } else {
+      const parts = Object.entries(reasons).map(([k, v]) => `${v}/${sorted.length} ${k}`).join(', ');
+      html += `   <span class="bad">✗ Fit 失败：只凑到 ${picked.length}/${nums} 张</span>\n`;
+      if (picked.length > 0) html += `   <span class="dim">reason[AllocatedCardsInsufficientRequest] = ${picked.length}</span>\n`;
+      html += `   <span class="bad">返回原因字符串：「${parts}」</span>\n`;
+      html += `   <span class="dim">→ 这个节点被判 unfit，字符串经 ParseReason 聚合后写进 Pod event</span>`;
+    }
+    out.innerHTML = html;
+  }
+  ['f_nums','f_mem','f_core','f_policy','f_extra'].forEach(id =>
+    document.getElementById(id).addEventListener('input', run));
+  run();
+})();
+</script>
+</body>
+</html>
