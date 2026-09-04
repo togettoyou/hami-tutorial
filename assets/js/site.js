@@ -13,10 +13,10 @@
  * ---------------------------------------------------------- */
 const SOURCE = {
   repo:    'togettoyou/HAMi',
-  commit:  '95530c6ad09c4f3cf8651cfe53a89eda69238a85',
-  short:   '95530c6',
+  commit:  '347502f4733e8f43dcc344a653e790ef30943097',
+  short:   '347502f',
   version: 'v2.10.0',
-  date:    '2026-09-02',
+  date:    '2026-09-03',
   upstream:'Project-HAMi/HAMi',
   tutorial:'togettoyou/hami-tutorial',   // 本教程自己的仓库
 };
@@ -50,7 +50,7 @@ const CHAPTERS = [
     { id: '01', file: '01-protocol.html',     title: '注解协议',
       desc: '三个进程之间传的那串字符串', time: '2 h' },
     { id: '02', file: '02-devices.html',      title: 'Devices 接口与数据结构',
-      desc: '15 个方法，12 家硬件共用的契约', time: '3 h' },
+      desc: '13 个方法，13 家硬件共用的契约', time: '3 h' },
   ]},
   { stage: '一个 Pod 的旅程', items: [
     { id: '03', file: '03-webhook.html',      title: 'Webhook 准入',

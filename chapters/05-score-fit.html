@@ -784,7 +784,7 @@ func (ns *NodeScore) OverrideScore(previous []*device.DeviceUsage, policy string
       </li>
       <li>
         <span class="st">验证排序方向</span>
-        <div class="codeblock" data-lang="bash"><pre><code>go test ./pkg/scheduler/policy/ -run TestGPUPolicy -v -count=1
+        <div class="codeblock" data-lang="bash"><pre><code>go test ./pkg/scheduler/policy/ -run "TestDeviceUsageList_Less|TestComputeScore" -v -count=1
 sed -n '1,120p' pkg/scheduler/policy/gpu_policy_test.go   # 742 行，全是排序用例</code></pre></div>
       </li>
       <li>
@@ -859,7 +859,7 @@ sed -n '1,120p' pkg/scheduler/policy/gpu_policy_test.go   # 742 行，全是排�
       <div class="expl">
         看代码里那段注释：实现这个接口的后端不许在 ScoreNode 里检查调度策略，
         只管返回「越高越好」的分数；<code>OverrideScore</code> 统一负责在 spread 策略下取反。
-        <br>好处：<strong>加新策略时只改一个地方</strong>，不用挨个改 12 个后端。
+        <br>好处：<strong>加新策略时只改一个地方</strong>，不用挨个改当前 16 个后端实现。
         这是「把变化点收敛到单点」的经典做法，
       </div>
     </div>

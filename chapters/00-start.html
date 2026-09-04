@@ -46,7 +46,7 @@
     <table>
       <tr><th style="width:160px">组件</th><th style="width:130px">跑在哪</th><th>负责什么</th></tr>
       <tr><td>Device Plugin</td><td>每个 GPU 节点</td>
-        <td>每 30 秒向集群汇报本机有几张卡、每张多大、还剩多少</td></tr>
+        <td>每 30 秒扫描本机设备；清单变化时向集群更新有几张卡、每张多大、还剩多少</td></tr>
       <tr><td>Scheduler Extender</td><td>集群，多副本选主</td>
         <td>根据「要几张、要多少显存、要不要挨着」选出节点和具体的卡，把结果写进 Pod 注解</td></tr>
       <tr><td>HAMi-core</td><td>每个业务容器内</td>
@@ -55,8 +55,9 @@
     </div>
 
     <p>
-      这三件事分别由三个独立进程完成，它们<strong>不直接通信</strong>，
-      而是通过 Kubernetes 上的注解（annotation）字符串传话。
+      这三件事分别由三个独立进程完成，主链路通过 Kubernetes 上的注解
+      （annotation）字符串传话。NUMA refit 是一个例外：设备插件会直接调用调度器的
+      <code>/refit</code> 接口，第 10 章会展开。
       这就是下一章要讲的注解协议，也是整个项目的骨架。
     </p>
 
@@ -87,7 +88,7 @@
     <h3>2.2 拉代码并切到对照的 commit</h3>
 
     <p>
-      本教程所有行号都对应 commit <code>95530c6</code>。<strong>强烈建议你也切过去</strong>，
+      本教程所有行号都对应 commit <code>347502f</code>。<strong>强烈建议你也切过去</strong>，
       这样文中说的「第 853 行」在你本地也确实是第 853 行。
     </p>
 
@@ -96,7 +97,7 @@
 cd HAMi
 
 # 切到本文对照的 commit，行号完全一致
-git checkout 95530c6ad09c4f3cf8651cfe53a89eda69238a85
+git checkout 347502f4733e8f43dcc344a653e790ef30943097
 
 # 拉依赖（国内建议先设代理）
 go env -w GOPROXY=https://goproxy.cn,direct
@@ -137,8 +138,9 @@ $(DEVICES):
       <p style="margin-bottom:0">
         <code>make build</code> 在 Windows 上会失败（部分代码有 <code>_linux.go</code> 后缀，
         比如 <span data-srcref="pkg/device-plugin/nvidiadevice/nvinternal/hostpid/broker_linux.go"></span>）。
-        但<strong>单元测试完全能跑</strong>，读源码不受影响。
-        想编译就用 WSL2 或者加 <code>GOOS=linux go build ./...</code> 做语法检查。
+        纯 Go 的编解码测试可以原生运行，但 scheduler / NVIDIA 包依赖 NVML 的
+        <code>dlfcn.h</code>，在原生 Windows 下也会编译失败。
+        请用 WSL2 或 Linux 运行本教程的完整构建和测试命令；读源码本身不受影响。
       </p>
     </div>
 
@@ -160,10 +162,10 @@ $(DEVICES):
     <div class="note">
       <div class="t">关键判断</div>
       <p style="margin-bottom:0">
-        <code>pkg/device/</code> 有 11,447 行，看着吓人 —— 但其中 <strong>12 个厂商后端是高度重复的</strong>：
-        每个都实现同一套 15 个方法，结构几乎一模一样。
-        你只需要精读 nvidia 一个（3,800 行），外加一个最简单的（比如 kunlun，约 400 行）做对照，
-        剩下 10 个扫一眼就懂。真正需要逐行读的核心只有大约 <b>5,000 行</b>。
+        <code>pkg/device/</code> 有 11,447 行，看着吓人 —— 但其中 <strong>13 家厂商的后端高度重复</strong>，
+        共实现了 16 个 <code>Fit()</code>（部分厂商有两种逻辑设备），都遵守同一个 13 方法接口。
+        你只需要精读 NVIDIA 的主实现，外加一个最简单的（比如 kunlun，245 行）做对照，
+        其余后端按需扫读。真正需要逐行读的核心只有大约 <b>5,000 行</b>。
       </p>
     </div>
 
@@ -287,7 +289,7 @@ go test ./pkg/... -short -race -count=1</code></pre>
     </p>
 
     <div class="codeblock" data-lang="bash">
-<pre><code># 找某个接口方法的所有实现（12 个后端都会出来）
+<pre><code># 找某个接口方法的所有实现（当前会列出 16 个 Fit 实现）
 grep -rn ") Fit(" pkg/device/ --include=*.go | grep -v _test
 
 # 找某个结构体的所有方法
@@ -385,9 +387,9 @@ func TestScratch(t *testing.T) {
       <div class="opt" data-k="A"><span class="k">A</span><span><code>pkg/device/devices.go</code>（接口与数据结构）</span></div>
       <div class="opt" data-k="B"><span class="k">B</span><span><code>pkg/scheduler/score.go</code>（打分主流程）</span></div>
       <div class="opt" data-k="C"><span class="k">C</span><span><code>pkg/device/nvidia/device.go</code>（NVIDIA 后端）</span></div>
-      <div class="opt" data-k="D"><span class="k">D</span><span><code>pkg/device/cambricon/</code>、<code>hygon/</code>、<code>metax/</code>… 等 11 个其他厂商后端</span></div>
+      <div class="opt" data-k="D"><span class="k">D</span><span><code>pkg/device/cambricon/</code>、<code>hygon/</code>、<code>metax/</code>… 等其他厂商后端</span></div>
       <div class="expl">
-        这 11 个后端都实现同一套 <code>Devices</code> 接口，结构高度雷同。
+        这些后端都实现同一套 <code>Devices</code> 接口，结构高度雷同。
         精读 nvidia 一个 + 扫一个最简单的（如 <code>kunlun</code>）做对照就够了，
         剩下的等你真要改某家硬件时再看。
         把时间花在 A、B、C 上，那才是主干。
@@ -397,7 +399,7 @@ func TestScratch(t *testing.T) {
     <h2>7. 小结</h2>
 
     <ul>
-      <li>HAMi = <b>Device Plugin</b>（汇报每张卡的规格与余量）+ <b>Scheduler Extender</b>（选节点选卡，把结果写进注解）+ <b>HAMi-core</b>（在容器里拦住越界），三个进程不直接通信，全靠<b>注解字符串</b>传话。</li>
+      <li>HAMi = <b>Device Plugin</b>（汇报每张卡的规格与余量）+ <b>Scheduler Extender</b>（选节点选卡，把结果写进注解）+ <b>HAMi-core</b>（在容器里拦住越界）。主链路靠<b>注解字符串</b>传话，NUMA refit 例外地会直接调用调度器。</li>
       <li>真正需要精读的核心大约 <b>5,000 行</b>，不是 28,000 行。</li>
       <li>核心逻辑全是纯函数，<b>用单元测试当调试器</b>，不需要集群不需要 GPU。</li>
       <li>三板斧：<b>按签名 grep</b> 定位、<b>跟着测试读</b>、<b>加日志或写临时测试</b>验证。</li>
@@ -415,7 +417,7 @@ func TestScratch(t *testing.T) {
 // ---- 代码量分布互动图 ----
 (function () {
   const DATA = [
-    { name: 'pkg/device/',        loc: 11447, note: '设备抽象层 + 12 个厂商后端。核心是 devices.go（接口与数据结构，774 行），nvidia/ 占 3800 行，其余 11 家高度雷同。', ch: '第 02、05、10 章' },
+    { name: 'pkg/device/',        loc: 11447, note: '设备抽象层 + 13 家厂商、16 个 Fit 实现。核心是 devices.go（接口与数据结构，774 行）；NVIDIA 生产代码 2344 行，其余后端结构高度雷同。', ch: '第 02、05、10 章' },
     { name: 'pkg/device-plugin/', loc: 7714,  note: 'NVIDIA 设备插件内部实现，从 NVIDIA 官方 k8s-device-plugin fork 改造而来。核心是 plugin/server.go（1245 行）的 ListAndWatch 和 Allocate。', ch: '第 08 章' },
     { name: 'pkg/scheduler/',     loc: 3861,  note: '调度器扩展器。scheduler.go（1245 行）是 Filter/Bind 主流程，score.go（473 行）是打分，policy/ 是 binpack/spread 排序规则。真正的核心只有约 2000 行。', ch: '第 04、05、06 章' },
     { name: 'cmd/',               loc: 2811,  note: '三个二进制的入口：flag 解析、组件启动、HTTP 路由注册。信息密度低，扫一遍知道有什么就行。', ch: '第 00、04 章' },

@@ -449,7 +449,7 @@ func (m *nodeLockManager) getLock(nodeName string) *sync.Mutex {
         「这个对象自你读取之后有没有被别人改过」。改过就返回 409 Conflict，
         <code>retry.OnError</code> 重新读一遍再试。
         <br>这就是 Compare-And-Swap，只不过用 HTTP 实现的。
-        <br>重试策略在 <span data-srcref="pkg/util/nodelock/nodelock.go:57"></span>：
+        <br>重试策略在 <span data-srcref="pkg/util/nodelock/nodelock.go:58"></span>：
         5 次，100ms 起步，指数退避 2 倍，带 0.5 抖动。
       </p>
     </div>

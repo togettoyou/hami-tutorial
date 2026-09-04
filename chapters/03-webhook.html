@@ -197,7 +197,7 @@
 	// 1. Process InitContainers
 	for idx := range pod.Spec.InitContainers {
 		c := &amp;pod.Spec.InitContainers[idx]
-		for _, val := range device.GetDevices() {              // 遍历 12 家厂商
+		for _, val := range device.GetDevices() {              // 遍历所有已注册后端
 			found, err := val.MutateAdmission(c, pod)          // ← 每家都问一遍
 			if err != nil {
 				klog.Errorf("validating pod failed:%s", err.Error())
@@ -546,7 +546,7 @@ sed -n '45,130p' pkg/device/nvidia/device_test.go</code></pre></div>
       </li>
       <li>
         <span class="st">跑 webhook 层的测试</span>
-        <div class="codeblock" data-lang="bash"><pre><code>go test ./pkg/scheduler/ -run "TestWebhook|Test_Handle" -v -count=1
+        <div class="codeblock" data-lang="bash"><pre><code>go test ./pkg/scheduler/ -run TestHandle -v -count=1
 # webhook_test.go 有 1355 行，覆盖了各种拒绝场景
 grep -n "^func Test" pkg/scheduler/webhook_test.go</code></pre></div>
       </li>

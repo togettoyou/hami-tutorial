@@ -15,15 +15,15 @@
     <div class="page-kicker">第 02 章 · 第一阶段 打地基</div>
     <h1 class="page-title">Devices 接口与核心数据结构</h1>
     <p class="page-lede">
-      全项目只有<strong>一个</strong>核心抽象：15 个方法的 <code>Devices</code> 接口。
-      12 家硬件厂商各自实现它，调度器只跟接口打交道。
+      全项目只有<strong>一个</strong>核心抽象：13 个方法的 <code>Devices</code> 接口。
+      13 家硬件厂商各自实现它，调度器只跟接口打交道。
       看懂这一章，你就知道「加一个新硬件」到底要写哪些代码。
     </p>
 
     <div class="goals">
       <h3>学完这章你应该能</h3>
       <ul>
-        <li>把 15 个接口方法按「生命周期阶段」正确归类，说出各自在什么时候被调用</li>
+        <li>把 13 个接口方法按「生命周期阶段」正确归类，说出各自在什么时候被调用</li>
         <li>分清 <code>DeviceInfo</code> / <code>DeviceUsage</code> / <code>ContainerDeviceRequest</code> / <code>ContainerDevice</code> 四个结构体的职责</li>
         <li>解释 <code>PodDevices</code> 三层嵌套 map 的每一层是什么</li>
         <li>说出「新增一个厂商设备后端」需要改哪几个文件</li>
@@ -31,7 +31,7 @@
       </ul>
     </div>
 
-    <h2>1. 一个接口撑起 12 家厂商</h2>
+    <h2>1. 一个接口撑起 13 家厂商</h2>
 
     <div class="note analogy">
       <div class="t">这个抽象换来了什么</div>
@@ -43,7 +43,7 @@
       </p>
     </div>
 
-    <p>接口定义就在这里，一共 15 个方法：</p>
+    <p>接口定义就在这里，一共 13 个方法：</p>
 
     <div class="codeblock" data-file="pkg/device/devices.go" data-start="34" data-lang="go">
 <pre><code>type Devices interface {
@@ -69,7 +69,7 @@
     </p>
 
     <div class="lab">
-      <header>15 个方法的调用时机<span class="badge">互动</span></header>
+      <header>13 个方法的调用时机<span class="badge">互动</span></header>
       <div class="body">
         <p style="font-size:13.5px;color:var(--fg-soft);margin-bottom:12px">
           点任意一个方法，看它在什么时候被谁调用、干什么、返回什么。
@@ -617,7 +617,7 @@ PodDevices["NVIDIA"][0][1]    → ContainerDevice   // 第 0 个容器的第 1 �
     <ol class="steps">
       <li>
         <span class="st">新建 <code>pkg/device/&lt;厂商&gt;/device.go</code></span>
-        定义 <code>XxxDevices</code> 结构体，实现全部 15 个接口方法。
+        定义 <code>XxxDevices</code> 结构体，实现全部 13 个接口方法。
         抄 <code>pkg/device/kunlun/</code> 起步最快。
       </li>
       <li>
@@ -726,7 +726,7 @@ grep -n "func buildNodeUsage" -A 40 pkg/scheduler/scheduler.go</code></pre></div
 
     <div class="quiz" data-answer="D">
       <div class="q">你要给一款新的国产 AI 芯片写 HAMi 支持。下面哪一步<strong>不需要</strong>做？</div>
-      <div class="opt" data-k="A"><span class="k">A</span><span>实现 <code>Devices</code> 接口的全部 15 个方法</span></div>
+      <div class="opt" data-k="A"><span class="k">A</span><span>实现 <code>Devices</code> 接口的全部 13 个方法</span></div>
       <div class="opt" data-k="B"><span class="k">B</span><span>在 <code>InitDevicesWithConfig()</code> 的 <code>deviceInitializers</code> 里注册</span></div>
       <div class="opt" data-k="C"><span class="k">C</span><span>往 <code>InRequestDevices</code> / <code>SupportDevices</code> 注册注解 key</span></div>
       <div class="opt" data-k="D"><span class="k">D</span><span>修改 <code>pkg/scheduler/score.go</code> 的打分逻辑来支持新硬件</span></div>
@@ -741,7 +741,7 @@ grep -n "func buildNodeUsage" -A 40 pkg/scheduler/scheduler.go</code></pre></div
     <h2>9. 小结</h2>
 
     <ul>
-      <li><code>Devices</code> 接口 15 个方法 = <b>「国标插座」</b>，12 家厂商各自实现，调度器只认接口。</li>
+      <li><code>Devices</code> 接口 13 个方法 = <b>「国标插座」</b>，13 家厂商各自实现，调度器只认接口。</li>
       <li>按生命周期分六组：启动注册 → 节点巡检 → 准入 → 调度打分 → 写决策 → 绑定。</li>
       <li>同一张卡四副面孔：<b>DeviceInfo</b>（房产证，静态）、<b>DeviceUsage</b>（登记表，动态、会被改）、
           ContainerDeviceRequest（需求单）、ContainerDevice（租约）。</li>
@@ -761,7 +761,7 @@ grep -n "func buildNodeUsage" -A 40 pkg/scheduler/scheduler.go</code></pre></div
 
 <script src="../assets/js/site.js"></script>
 <script>
-/* ========== 实验室 1：15 个方法的调用时机 ========== */
+/* ========== 实验室 1：13 个方法的调用时机 ========== */
 (function () {
   const M = [
     { n: 'CommonWord', stage: '① 启动', who: '各处',

@@ -2,8 +2,21 @@
 // （检查器 check.js 只验文件存在 + 行号不越界，这个验的是「内容对不对得上」）
 const fs = require('fs'), path = require('path');
 
-const ROOT = process.argv[2] || path.join(__dirname, '..');
-const REPO = path.resolve(ROOT, '..');
+const ROOT = path.resolve(process.argv[2] || path.join(__dirname, '..'));
+const sourceArg = process.argv[3] || process.env.HAMI_SOURCE_ROOT;
+const sourceCandidates = [
+  sourceArg,
+  path.resolve(ROOT, '..'),
+  path.resolve(ROOT, '..', 'HAMI'),
+  path.resolve(ROOT, '..', 'HAMi'),
+].filter(Boolean).map(p => path.resolve(p));
+const REPO = sourceCandidates.find(p =>
+  fs.existsSync(path.join(p, 'go.mod')) &&
+  fs.existsSync(path.join(p, 'pkg', 'device', 'devices.go')));
+if (!REPO) {
+  console.error('找不到 HAMi 源码。用法: node tools/check-lines.js [教程目录] [HAMi 源码目录]，或设置 HAMI_SOURCE_ROOT。');
+  process.exit(2);
+}
 const files = fs.readdirSync(path.join(ROOT, 'chapters'))
   .filter(f => f.endsWith('.html')).sort().map(f => 'chapters/' + f);
 
@@ -68,7 +81,7 @@ for (const rel of files) {
   }
 }
 
-console.log(`比对了 ${checked} 个带行号的代码块\n`);
+console.log(`源码目录: ${REPO}\n比对了 ${checked} 个带行号的代码块\n`);
 if (report.length) console.log(report.join('\n') + '\n');
 console.log(bad === 0
   ? `✅ 无行号偏移${warn ? `（${warn} 处需人工确认）` : ''}`

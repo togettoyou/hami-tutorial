@@ -15,7 +15,7 @@
     <div class="page-kicker">第 12 章 · 第四阶段 成为贡献者</div>
     <h1 class="page-title">速查手册</h1>
     <p class="page-lede">
-      读码时随手翻的一页。所有链接都指向 commit <code>95530c6</code>。
+      读码时随手翻的一页。所有链接都指向 commit <code>347502f</code>。
     </p>
 
     <div class="goals">
@@ -69,8 +69,8 @@
         <td><b>逗号串</b>（<code>DecodeNodeDevices</code>）：<br>
             <code>{UUID},{Count},{Devmem},{Devcore},{Type},{Numa},{Health}[,{Index},{Mode}]</code>，卡间用 <code>:</code><br>
             接受 7 或 9 字段；<b>Type 里不能有逗号</b>（无转义）</td></tr>
-      <tr><td><code>hami.io/node-handshake</code></td><td>双方</td>
-        <td><code>Requesting_{ts}</code>（调度器点名）/ <code>Reported {ts}</code>（插件答到）。<b>60 秒</b>超时</td></tr>
+      <tr><td><code>hami.io/node-handshake</code></td><td>调度器</td>
+        <td><code>Requesting_{ts}</code> 宽限标记；<b>60 秒</b>后结合 <code>Allocatable</code> 判断。当前内置 NVIDIA 插件不写 <code>Reported</code></td></tr>
       <tr><td><code>hami.io/node-nvidia-score</code></td><td>设备插件</td>
         <td>卡间 NVLink pair score，JSON。需 <code>ENABLE_TOPOLOGY_SCORE=true</code></td></tr>
       <tr><td><code>hami.io/mutex.lock</code></td><td>调度器</td>
@@ -168,7 +168,7 @@
       <tr><td><span data-srcref="pkg/scheduler/webhook.go"></span></td><td>216</td><td>准入：改 schedulerName、配额检查</td></tr>
       <tr><td><span data-srcref="pkg/scheduler/routes/route.go"></span></td><td>224</td><td>HTTP 路由：/filter /bind /webhook /refit</td></tr>
       <tr><td><span data-srcref="pkg/scheduler/config/config.go"></span></td><td>497</td><td>InitDevicesWithConfig：所有后端在这注册</td></tr>
-      <tr><td><span data-srcref="pkg/scheduler/numa_refit_handler.go"></span></td><td>478</td><td>NUMA 回填</td></tr>
+      <tr><td><span data-srcref="pkg/scheduler/numa_refit_handler.go"></span></td><td>470</td><td>NUMA 回填</td></tr>
       <tr><td colspan="3" style="background:var(--bg-soft);font-weight:650">设备后端</td></tr>
       <tr><td><span data-srcref="pkg/device/nvidia/device.go"></span></td><td>1140</td><td><b>NVIDIA 后端</b>，Fit 在 853 行</td></tr>
       <tr><td><span data-srcref="pkg/device/nvidia/mig_topology.go"></span></td><td>436</td><td>MIG placement 打分 + 贪心/回溯装箱</td></tr>
@@ -290,7 +290,7 @@ kubectl logs -n kube-system deploy/hami-scheduler -c vgpu-scheduler-extender --t
       <tr><td><b>spread</b></td><td>摊开策略：优先用最空闲的资源，均衡负载</td></tr>
       <tr><td><b>mutex</b></td><td>互斥策略：只分配完全空闲的卡（独占）</td></tr>
       <tr><td><b>Count / 切分份数</b></td><td>一张卡最多被几个容器共享，默认 10</td></tr>
-      <tr><td><b>handshake</b></td><td>调度器和设备插件之间的「点名答到」保活机制</td></tr>
+      <tr><td><b>handshake</b></td><td>调度器写入的宽限标记；超时后与 kubelet 的 <code>Allocatable</code> 交叉验证健康状态</td></tr>
       <tr><td><b>refit</b></td><td>NUMA 回填：kubelet 拒绝调度器选的卡时，请求重新选</td></tr>
       <tr><td><b>PodGroup</b></td><td>协同调度（Gang Scheduling）里的一批 Pod，要么全成功要么全失败</td></tr>
       <tr><td><b>墓碑 / tombstone</b></td><td><code>cache.DeletedFinalStateUnknown</code>，informer 断连期间删除事件的包装</td></tr>

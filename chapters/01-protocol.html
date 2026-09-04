@@ -55,7 +55,7 @@
     <table>
       <tr><th style="width:120px">方案</th><th>优点</th><th>为什么 HAMi 没选</th></tr>
       <tr><td>gRPC 直连</td><td>类型安全、高效</td><td>需要服务发现、重连、TLS；组件重启就丢状态</td></tr>
-      <tr><td>自定义 CRD</td><td>结构化、可校验</td><td>要装 CRD、要 RBAC、要 controller；对「每 30 秒更新一次」的高频写入太重</td></tr>
+      <tr><td>自定义 CRD</td><td>结构化、可校验</td><td>要装 CRD、要 RBAC、要 controller；设备插件按 30 秒周期扫描，额外控制面更重</td></tr>
       <tr><td><b>注解字符串</b></td><td>零额外部署、天然持久化、kubectl 就能看</td><td>—（选它）</td></tr>
     </table>
     </div>
@@ -66,7 +66,7 @@
       <div class="node">
         <div class="h">Node 注解 · 「我这台机器有什么」<span class="tag">设备插件写 → 调度器读</span></div>
         <div class="d">
-          <code>hami.io/node-nvidia-register</code> — 设备清单（每 30 秒刷新一次）<br>
+          <code>hami.io/node-nvidia-register</code> — 设备清单（每 30 秒扫描，变化时更新）<br>
           <code>hami.io/node-handshake</code> — 心跳握手，判断节点是否掉线
         </div>
       </div>
@@ -601,17 +601,18 @@ func EncodePodDevices(checklist map[string]string, pd PodDevices) map[string]str
     <h2>5. Handshake：怎么判断一个节点掉线了</h2>
 
     <p>
-      设备插件每 30 秒刷新一次注解。但如果节点宕机、网络断了，注解就<strong>停在那里不动</strong>了 ——
-      调度器怎么知道这份设备清单已经过期？
+      设备插件每 30 秒扫描一次设备，但清单没变化时不会重写注册注解。
+      因此调度器不能把「注解没变化」直接当成掉线，而要结合握手时间和 kubelet 上报的
+      <code>Allocatable</code> 一起判断。
     </p>
 
     <div class="note analogy">
-      <div class="t">点名答到</div>
+      <div class="t">宽限期 + 第二信号</div>
       <p style="margin-bottom:0">
-        调度器（老师）在注解上写 <code>Requesting_{当前时间}</code>（「点名了，报数」）。<br>
-        设备插件（学生）看到后，把它改成 <code>Reported {当前时间}</code>（「到！」）。<br>
-        如果老师发现自己写的 <code>Requesting</code> 超过一定时间还没被改成 <code>Reported</code>，
-        就认为这个学生不在了。
+        调度器在注解上写 <code>Requesting_{当前时间}</code>，把它当作 60 秒宽限期的起点。<br>
+        当前内置 NVIDIA 设备插件<strong>不会</strong>把它改成 <code>Reported</code>；60 秒后，
+        调度器再看 kubelet 是否仍上报 GPU <code>Allocatable</code>。只有握手过期且
+        <code>Allocatable</code> 也归零，才判定节点不健康。
       </p>
     </div>
 
@@ -619,7 +620,7 @@ func EncodePodDevices(checklist map[string]string, pd PodDevices) map[string]str
 <pre><code>func CheckHealth(devType string, resourceCountName string, node *corev1.Node) (bool, bool) {
 	handshake := node.Annotations[util.HandshakeAnnos[devType]]
 	if strings.Contains(handshake, "Requesting") {
-		// 状态一：我上次点了名，看看学生答到了没
+		// 状态一：上次写入的宽限标记仍在
 		_, timestampStr, found := strings.Cut(handshake, "_")
 		if !found {
 			return true, false
@@ -632,7 +633,7 @@ func EncodePodDevices(checklist map[string]string, pd PodDevices) map[string]str
 			return true, false                       // 还没到 60 秒，再等等
 		}
 
-		// 超时了，但再兜一层底：如果 kubelet 还在上报 Allocatable，说明节点其实活着
+		// 超时后看第二信号：kubelet 仍上报 Allocatable 就保持健康
 		qty := node.Status.Allocatable[corev1.ResourceName(resourceCountName)]
 		if qty.Value() &gt; 0 {
 			klog.V(5).InfoS("Handshake expired but Allocatable still present, skipping NodeCleanUp", ...)
@@ -641,7 +642,7 @@ func EncodePodDevices(checklist map[string]string, pd PodDevices) map[string]str
 		return false, false                          // 判定掉线 → 触发 NodeCleanUp
 
 	} else {
-		// 状态二：注解是 "Reported ..." 或者空的 → 发起一次新的点名
+		// 状态二：不是 Requesting（空值或兼容旧值）→ 写入新的宽限标记
 		_, ok := util.HandshakeAnnos[devType]
 		if ok {
 			tmppat := make(map[string]string)
@@ -666,17 +667,17 @@ func EncodePodDevices(checklist map[string]string, pd PodDevices) map[string]str
     <table>
       <tr><th style="width:150px">返回值</th><th style="width:110px">名字</th><th>调用方（调度器 register 循环）拿它干什么</th></tr>
       <tr><td><code>(true, true)</code></td><td>健康 + 需更新</td><td>正常路径：刷新缓存里这个节点的设备清单</td></tr>
-      <tr><td><code>(true, false)</code></td><td>健康 + 不用更新</td><td>点名还在等回复，跳过本轮</td></tr>
+      <tr><td><code>(true, false)</code></td><td>健康 + 不用更新</td><td>仍在 60 秒宽限期内，或超时但 <code>Allocatable</code> 仍有资源；跳过本轮更新</td></tr>
       <tr><td><code>(false, false)</code></td><td>不健康</td><td>调 <code>NodeCleanUp()</code>，从调度器缓存里摘掉这个节点</td></tr>
     </table>
     </div>
 
     <div class="note trap">
-      <div class="t">踩坑：这里有两个不同的超时</div>
+      <div class="t">踩坑：旧文档描述的是另一套握手模型</div>
       <p style="margin-bottom:0">
-        代码里是 <strong>60 秒</strong>（<code>time.Second * 60</code>），
-        但项目文档 <code>docs/develop/protocol.md</code> 里写的是 <strong>5 分钟</strong>。
-        文档没跟上代码。<em>顺手改文档，就是一个能被合入的 PR。</em>
+        项目文档 <code>docs/develop/protocol.md</code> 仍写「插件回复 <code>Reported</code>，5 分钟超时」，
+        当前代码则是「调度器写 <code>Requesting</code>，60 秒后结合 <code>Allocatable</code>」。
+        读这段逻辑时应以固定提交中的实现为准。
       </p>
     </div>
 
@@ -686,9 +687,9 @@ func EncodePodDevices(checklist map[string]string, pd PodDevices) map[string]str
     <table>
       <tr><th style="width:44px">对象</th><th style="width:270px">注解 Key</th><th style="width:110px">谁写</th><th>含义</th></tr>
       <tr><td>Node</td><td><code>hami.io/node-nvidia-register</code></td><td>设备插件</td><td>设备清单，<b>JSON 数组</b>（amd / ascend / biren / vastai 同格式；hygon / iluvatar 用逗号串）</td></tr>
-      <tr><td>Node</td><td><code>hami.io/node-handshake</code></td><td>双方</td><td><code>Requesting_ts</code> / <code>Reported ts</code> 心跳</td></tr>
+      <tr><td>Node</td><td><code>hami.io/node-handshake</code></td><td>调度器</td><td><code>Requesting_ts</code> 宽限标记；60 秒后结合 <code>Allocatable</code> 判断</td></tr>
       <tr><td>Node</td><td><code>hami.io/node-nvidia-score</code></td><td>设备插件</td><td>卡间 NVLink 连接分数（JSON），拓扑调度用</td></tr>
-      <tr><td>Node</td><td><code>hami.io/mutex.lock</code></td><td>调度器</td><td><b>节点锁</b>：<code>ns_podname_时间戳</code>，防并发超卖（第 07 章）</td></tr>
+      <tr><td>Node</td><td><code>hami.io/mutex.lock</code></td><td>调度器</td><td><b>节点锁</b>：<code>{RFC3339 时间},{namespace},{podName}</code>，防并发超卖（第 07 章）</td></tr>
       <tr><td>Node</td><td><code>hami.io/device-cordon</code></td><td>运维手动</td><td>逗号分隔的 UUID 列表，把某几张卡排除出新分配</td></tr>
       <tr><td>Pod</td><td><code>hami.io/vgpu-devices-to-allocate</code></td><td>调度器</td><td>分配决策，设备插件消费后清空</td></tr>
       <tr><td>Pod</td><td><code>hami.io/vgpu-devices-allocated</code></td><td>调度器</td><td>同上内容，永久留档</td></tr>
@@ -829,7 +830,8 @@ rm pkg/device/scratch_test.go   # 用完删掉</code></pre></div>
       <div class="expl">
         超过 60 秒确实算超时，但代码<strong>多兜了一层底</strong>：
         去查 <code>node.Status.Allocatable[nvidia.com/gpu]</code>。
-        如果 kubelet 仍在正常上报这个资源，说明设备插件其实活着（可能只是注解 patch 失败了），
+        如果 kubelet 仍在正常上报这个资源，就不能仅凭一直存在的 <code>Requesting</code> 判死；
+        当前内置 NVIDIA 插件本来就不会写 <code>Reported</code>，
         这时贸然清理会导致<strong>整个节点上的 GPU 被误摘</strong>。
         只有 Allocatable 也归零，才真正返回 <code>(false, false)</code> 触发清理。
         <br>「多个信号交叉验证后才做破坏性操作」是分布式系统里的常见做法。
@@ -853,7 +855,7 @@ rm pkg/device/scratch_test.go   # 用完删掉</code></pre></div>
     <h2>9. 小结</h2>
 
     <ul>
-      <li>三个进程都只跟 apiserver 打交道，靠注解传话，所以任何组件重启都不丢状态。</li>
+      <li>主调度链路通过 apiserver 上的注解传话；NUMA refit 例外地由设备插件直接请求调度器的 <code>/refit</code> 接口。</li>
       <li>Node 注解有<b>两套编码</b>：nvidia / amd / ascend / biren / kunlun-vdevice / vastai 用 JSON，
           hygon / iluvatar 用逗号串。<code>EncodeNodeDevices</code> 在 NVIDIA 路径上只用于调试日志。</li>
       <li>JSON 的每个字段都带 <code>omitempty</code>，零值 key 会整个消失。</li>
@@ -864,7 +866,7 @@ rm pkg/device/scratch_test.go   # 用完删掉</code></pre></div>
     </ul>
 
     <p class="next-hint">知道了「说什么话」，接下来看「谁在说」 ——
-        <code>Devices</code> 接口的 15 个方法，是 12 家硬件厂商共同遵守的契约。
+        <code>Devices</code> 接口的 13 个方法，是 13 家硬件厂商共同遵守的契约。
         看懂它，你就知道加一个新硬件要写哪些代码。</p>
 
     <div class="chapter-nav" id="chapterNav"></div>

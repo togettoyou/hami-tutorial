@@ -1,7 +1,21 @@
 // 教程站点校验：内联 JS 语法 + 标签配平 + 死链 + data-srcref 格式
 const fs = require('fs'), path = require('path'), vm = require('vm');
 
-const ROOT = process.argv[2] || path.join(__dirname, '..');
+const ROOT = path.resolve(process.argv[2] || path.join(__dirname, '..'));
+const sourceArg = process.argv[3] || process.env.HAMI_SOURCE_ROOT;
+const sourceCandidates = [
+  sourceArg,
+  path.resolve(ROOT, '..'),
+  path.resolve(ROOT, '..', 'HAMI'),
+  path.resolve(ROOT, '..', 'HAMi'),
+].filter(Boolean).map(p => path.resolve(p));
+const repoRoot = sourceCandidates.find(p =>
+  fs.existsSync(path.join(p, 'go.mod')) &&
+  fs.existsSync(path.join(p, 'pkg', 'device', 'devices.go')));
+if (!repoRoot) {
+  console.error('找不到 HAMi 源码。用法: node tools/check.js [教程目录] [HAMi 源码目录]，或设置 HAMI_SOURCE_ROOT。');
+  process.exit(2);
+}
 const files = [];
 if (fs.existsSync(path.join(ROOT, 'index.html'))) files.push('index.html');
 const chDir = path.join(ROOT, 'chapters');
@@ -55,7 +69,6 @@ for (const rel of files) {
 
   // --- 4. data-srcref 必须能对应到真实源码文件 ---
   const refRe = /data-srcref="([^"]+)"/g;
-  const repoRoot = path.resolve(ROOT, '..');
   while ((m = refRe.exec(src)) !== null) {
     const ref = m[1];
     const mm = ref.match(/^(.+?)(?::(\d+)(?:-(\d+))?)?$/);
@@ -107,7 +120,7 @@ for (const rel of files) {
   console.log(`${rel.padEnd(30)} 代码块 ${String(cb).padStart(2)} · 测验 ${qz} · 实验室 ${lab} · 内联脚本 ${n}`);
 }
 
-console.log('');
+console.log(`\n源码目录: ${repoRoot}`);
 if (report.length) { console.log(report.join('\n')); }
 console.log(problems === 0 ? '\n✅ 全部检查通过' : `\n❌ 共 ${problems} 个问题`);
 process.exit(problems === 0 ? 0 : 1);

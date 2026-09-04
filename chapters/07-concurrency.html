@@ -566,7 +566,7 @@ go test ./pkg/... -short -race -count=1</code></pre></div>
       <li>
         <span class="st">看专门为并发写的测试</span>
         <div class="codeblock" data-lang="bash"><pre><code>cat pkg/scheduler/register_race_test.go        # 125 行，专门测 register 的竞态
-go test ./pkg/scheduler/ -run TestRegisterRace -race -count=10 -v</code></pre></div>
+go test ./pkg/scheduler/ -run Test_register_NodeCacheConcurrency -race -count=10 -v</code></pre></div>
       </li>
       <li>
         <span class="st">故意制造一个竞态，看 race detector 怎么报</span>
@@ -583,7 +583,7 @@ git checkout pkg/scheduler/score.go   # 记得改回来</code></pre></div>
       <li>
         <span class="st">读 Pod 生命周期相关的测试</span>
         <div class="codeblock" data-lang="bash"><pre><code>cat pkg/scheduler/scheduler_pod_lifecycle_test.go
-go test ./pkg/scheduler/ -run "PodLifecycle" -v -count=1</code></pre></div>
+go test ./pkg/scheduler/ -run "Test_on(Add|Update)Pod_TerminatingPod" -v -count=1</code></pre></div>
       </li>
       <li>
         <span class="st">检查所有 DeleteFunc 是否都处理了墓碑</span>

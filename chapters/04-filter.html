@@ -210,7 +210,7 @@
     <div class="note">
       <div class="t"><code>allocLock</code> 保护什么</div>
       <p style="margin-bottom:0">
-        它的注释写得很清楚（<span data-srcref="pkg/scheduler/scheduler.go:82"></span>）：
+        它的注释写得很清楚（<span data-srcref="pkg/scheduler/scheduler.go:83"></span>）：
         序列化 <strong>Filter</strong>、<strong>NUMA refit</strong>（第 10 章）、
         Pod 更新释放 init 容器用量这三条会修改「预留账本」的路径。
         <br>注释还说：kube-scheduler 本身在一个调度周期内是串行调 Filter 的，

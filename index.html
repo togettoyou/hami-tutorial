@@ -19,7 +19,7 @@
       </p>
       <div class="meta-chips">
         <span class="chip">版本 <b>v2.10.0</b></span>
-        <span class="chip">commit <b>95530c6</b></span>
+        <span class="chip">commit <b>347502f</b></span>
         <span class="chip">Go 代码 <b>28,000 行</b></span>
         <span class="chip">代码块 <b>214</b></span>
       </div>
@@ -30,7 +30,8 @@
     <p>
       HAMi 的代码量不大，核心逻辑只有几千行。难的是它由三个独立进程组成：
       调度器扩展器、设备插件、容器里的 CUDA 劫持库。
-      三者不直接通信，全靠 Kubernetes 注解里的字符串传话。
+      主链路主要靠 Kubernetes 注解里的字符串传话；NUMA refit 是一个例外，
+      设备插件会直接请求调度器的 <code>/refit</code> 接口。
     </p>
 
     <p>
@@ -83,8 +84,8 @@
     </p>
 
     <p>
-      核心逻辑全是纯内存函数，不需要 GPU，也不需要 Kubernetes 集群。
-      打分、Fit 筛选、注解编解码都能用 <code>go test</code> 直接跑。
+      核心逻辑大多是纯内存函数，不需要 GPU，也不需要 Kubernetes 集群。
+      在 Linux 或 WSL2 下，打分、Fit 筛选、注解编解码都能用 <code>go test</code> 直接跑。
       项目自带的表驱动用例（<code>score_test.go</code> 有 4600 行）比任何文档都完整，
       改一个输入跑一次，比读十遍代码快。
     </p>
@@ -98,8 +99,8 @@
       <div class="t">源码链接的处理</div>
       <p style="margin-bottom:0">
         所有 GitHub 链接和 <code>文件:行号</code> 引用都指向 commit
-        <code>95530c6</code>（<code>origin/master</code>，2026-09-02），
-        上游后续改动不会让链接跳错行。本地对照时先 <code>git checkout 95530c6</code>。
+        <code>347502f</code>（2026-09-03），
+        上游后续改动不会让链接跳错行。本地对照时先 <code>git checkout 347502f</code>。
         换版本只需改 <code>assets/js/site.js</code> 顶部的 <code>SOURCE</code>，
         换版本后行号会漂移，需要重新校对。
       </p>

@@ -532,11 +532,12 @@ CHECK:
       <div class="t">Go 结构体必须和 C 结构体<b>逐字节对齐</b></div>
       <p style="margin-bottom:0">
         <code>pkg/monitor/nvidia/</code> 下有 <code>v0/spec.go</code> 和 <code>v1/spec.go</code> 两个版本，
-        对应 C 侧共享内存格式的两个版本。
-        <br>C 侧改了结构体而 Go 侧没跟着改，读出来就是垃圾数据（而且不会报错，
-        只是指标变成乱七八糟的数字）。
-        <br><em>这是跨语言共享内存的经典风险。改 <code>multiprocess/common_header.h</code> 时，
-        一定要同步检查 <code>pkg/monitor/nvidia/v*/spec.go</code>。</em>
+        对应 C 侧共享内存格式的两个版本。共享内存头已经包含 magic 和 major/minor version，
+        <code>loadCache()</code> 也会校验 magic、版本和最小尺寸。
+        <br>不过，如果 C 侧改了布局却没升级版本、Go 侧也没同步，已有校验仍无法识别这种错误，
+        指标就可能被错读。
+        <br><em>改 <code>multiprocess/multiprocess_memory_limit.h</code> 里的 <code>shared_region_t</code> 时，
+        必须同步检查 <code>pkg/monitor/nvidia/v*/spec.go</code>、升级版本并补布局断言。</em>
       </p>
     </div>
 
@@ -613,9 +614,10 @@ python -c "import torch; torch.zeros(1024**3, dtype=torch.int8, device='cuda')"
       </li>
       <li>
         <span class="st">检查 Go 侧和 C 侧的共享内存结构是否对齐</span>
-        <div class="codeblock" data-lang="bash"><pre><code>head -60 libvgpu/src/multiprocess/common_header.h
-head -60 pkg/monitor/nvidia/v1/spec.go
-# 逐字段对比，看有没有漂移</code></pre></div>
+        <div class="codeblock" data-lang="bash"><pre><code>sed -n '95,115p' libvgpu/src/multiprocess/multiprocess_memory_limit.h
+sed -n '1,120p' pkg/monitor/nvidia/v1/spec.go
+go test ./pkg/monitor/nvidia/... -run 'Test.*(Layout|Cache)' -count=1
+# 对照字段、偏移和大小，并用布局测试防止漂移</code></pre></div>
       </li>
     </ol>
 
@@ -693,7 +695,7 @@ head -60 pkg/monitor/nvidia/v1/spec.go
       <li>算力用<b>令牌桶</b>：kernel launch 花票（花完 <code>nanosleep</code> 阻塞），watcher 按利用率偏差发票。</li>
       <li>失效场景要牢记：特权容器、CUDA Graph、静态链接、新 API、改 ld.so.preload。</li>
       <li>HAMi-core 是资源公平共享机制，不是多租户安全边界。需要硬隔离就用 MIG。</li>
-      <li>Go 侧 <code>pkg/monitor/nvidia/v*/spec.go</code> 必须和 C 侧结构体<b>逐字节对齐</b>。</li>
+      <li>Go 侧 <code>pkg/monitor/nvidia/v*/spec.go</code> 必须和 C 侧结构体<b>逐字节对齐</b>；布局变化要升级版本并补断言。</li>
     </ul>
 
     <p class="next-hint">既然提到了硬隔离 —— 下一章讲 <strong>MIG</strong>（NVIDIA 的硬件级切分）、

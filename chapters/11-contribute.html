@@ -202,7 +202,7 @@ goimports -w -local github.com/Project-HAMi/HAMi ./pkg ./cmd</code></pre>
 go test ./pkg/scheduler/ -run Test_calcScore -v -count=1
 
 # 单个子测试（表驱动里的某一个用例）
-go test ./pkg/scheduler/ -run 'Test_calcScore/显存刚好够' -v -count=1
+go test ./pkg/scheduler/ -run 'Test_calcScore/one_node_one_device_one_pod_one_container_use_one_device' -v -count=1
 
 # 正则匹配多个
 go test ./pkg/device/... -run 'TestDecode|TestEncode' -v -count=1
@@ -309,7 +309,7 @@ go test ./pkg/... ./cmd/... -short -race -count=1</code></pre></div>
 <pre><code>fix(scheduler): validate NUMA refit quota with container positions
 feat(nvidia): score MIG placements and add backtracking fallback
 test(scheduler): add Go benchmarks for the Filter scoring path
-docs(develop): correct handshake timeout from 5m to 60s
+docs(develop): align handshake description with current health check
 build(deps): bump github/issue-labeler from 3.4 to 3.5</code></pre></div>
         <p style="font-size:13.5px;color:var(--fg-soft)">
           格式：<code>&lt;类型&gt;(&lt;范围&gt;): &lt;做了什么&gt;</code>，动词开头，小写，不加句号。
@@ -477,7 +477,7 @@ git push origin refactor/node-deleted-interface</code></pre>
     <div class="tbl-wrap">
     <table>
       <tr><th style="width:150px">方式</th><th>说明</th><th style="width:80px">门槛</th></tr>
-      <tr><td><b>改文档</b></td><td>比如第 01 章发现的：<code>docs/develop/protocol.md</code> 写 5 分钟，代码里是 60 秒</td><td>低</td></tr>
+      <tr><td><b>改文档</b></td><td>比如第 01 章发现的：<code>docs/develop/protocol.md</code> 仍描述 <code>Reported</code> + 5 分钟，当前实现是 <code>Requesting</code> + 60 秒 + <code>Allocatable</code></td><td>低</td></tr>
       <tr><td><b>补测试</b></td><td>给某个后端的 <code>Fit</code> 补边界用例；给覆盖率低的函数补测试</td><td>低</td></tr>
       <tr><td><b>改进错误信息</b></td><td>让 event / 日志更能指导用户「该怎么改」</td><td>低</td></tr>
       <tr><td><b>复现并报告 bug</b></td><td>带最小复现步骤的 issue，对维护者价值很高</td><td>低</td></tr>
@@ -603,12 +603,12 @@ git push origin refactor/node-deleted-interface</code></pre>
 /* ========== 实验室 2：贡献点清单 ========== */
 (function () {
   const TASKS = [
-    { lv: 1, t: '修正 protocol.md 里的握手超时', ch: '第 01 章',
-      d: '文档写「5 分钟」，代码 CheckHealth 里是 60 秒（time.Second * 60）。',
-      where: 'docs/develop/protocol.md · pkg/device/devices.go:604',
-      how: '改文档，顺便确认一下是不是文档对、代码错了 —— 如果是后者，那就是个 bug PR。' },
+    { lv: 1, t: '同步 protocol.md 的握手语义', ch: '第 01 章',
+      d: '文档仍写插件回复 Reported、5 分钟超时；当前内置 NVIDIA 插件不写 Reported，代码在 60 秒后结合 Allocatable 判断。',
+      where: 'docs/develop/protocol.md · pkg/device/devices.go:593 · pkg/device/nvidia/device.go:235',
+      how: '按当前实现补齐状态转换和第二信号，避免只改超时数字后仍然误导。' },
     { lv: 1, t: '补某个设备后端 Fit 的边界测试', ch: '第 02、05 章',
-      d: '12 个后端里，有些的 Fit 边界用例不全（显存差 1MB、算力刚好 100、份数用完等）。',
+      d: '当前 16 个 Fit 实现里，有些边界用例不全（显存差 1MB、算力刚好 100、份数用完等）。',
       where: 'pkg/device/*/device_test.go',
       how: '对照 nvidia 的 TestDevices_Fit（826 行起）补齐。零风险，纯增量。' },
     { lv: 1, t: '改进 Fit 失败时的错误信息', ch: '第 04、05 章',
@@ -632,10 +632,10 @@ git push origin refactor/node-deleted-interface</code></pre>
       d: 'getPendingPod 失败那条路径的 ReleaseNodeLock 被注释掉了，只能等 5 分钟超时。',
       where: 'pkg/device-plugin/.../plugin/server.go:862',
       how: '逻辑上确实不知道是哪个 Pod。可以考虑「按节点名释放」的兜底路径。先搜 issue。' },
-    { lv: 2, t: '给 pkg/monitor 的共享内存结构加版本校验', ch: '第 09 章',
-      d: 'Go 侧和 C 侧结构体必须逐字节对齐，不对齐时读出垃圾数据且不报错。',
-      where: 'pkg/monitor/nvidia/v*/spec.go · libvgpu/src/multiprocess/common_header.h',
-      how: '在共享内存头里加 magic + version 字段，读的时候校验。需要同时改 C 和 Go。' },
+    { lv: 2, t: '强化共享内存布局兼容测试', ch: '第 09 章',
+      d: '代码已有 magic、major/minor 版本校验和 v1 布局测试；仍需保证每次布局变化都升级版本并锁定字段偏移与大小。',
+      where: 'pkg/monitor/nvidia/cudevshr.go · pkg/monitor/nvidia/v*/spec_test.go · libvgpu/src/multiprocess/multiprocess_memory_limit.h',
+      how: '为 v0/v1 补齐偏移和大小断言，并在变更 shared_region_t 时同步升级版本与兼容分支。' },
     { lv: 2, t: '性能：减少 getNodesUsage 的全量重建', ch: '第 04 章',
       d: '每次 Filter 都把所有节点、所有 Pod 重算一遍。节点多时是热点。',
       where: 'pkg/scheduler/scheduler.go:773',
@@ -654,7 +654,7 @@ git push origin refactor/node-deleted-interface</code></pre>
       where: 'libvgpu/src/cuda/hook.c:320',
       how: 'C 代码 + 需要真实 GPU 验证 + 对 CUDA Graph 内部机制要熟。难度很高。' },
     { lv: 3, t: '新增一个设备后端', ch: '第 02 章',
-      d: '实现 Devices 接口 15 个方法 + 注册 + 配置 + Helm chart + 测试 + 示例。',
+      d: '实现 Devices 接口 13 个方法 + 注册 + 配置 + Helm chart + 测试 + 示例。',
       where: 'pkg/device/<vendor>/',
       how: '需要对应硬件。抄 pkg/device/kunlun/（245 行）起步最快。先开 issue。' },
   ];
