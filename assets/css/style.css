@@ -189,10 +189,20 @@ body {
 }
 
 /* ══ 侧边栏 ══ */
-.brand { flex: none; padding: 0 20px 18px; }
+.brand {
+  flex: none; padding: 0 20px 18px;
+  display: flex; align-items: flex-start; gap: 10px;
+}
 .brand a { text-decoration: none; color: inherit; display: block; border: 0; }
+.brand .brand-home { flex: 1 1 auto; min-width: 0; }
 .brand h1 { font-size: 15px; font-weight: 700; margin: 0 0 3px; letter-spacing: -.015em; }
 .brand .sub { font-size: 11px; color: var(--fg-3); font-family: var(--mono); }
+.brand-gh {
+  flex: 0 0 auto; display: flex !important; align-items: center; justify-content: center;
+  width: 28px; height: 28px; margin-top: -3px; border-radius: 6px;
+  color: var(--fg-3); transition: color .15s, background .15s;
+}
+.brand-gh:hover { color: var(--fg); background: var(--bg-sunken); }
 
 .progress-wrap { flex: none; padding: 0 20px 6px; }
 .progress-bar { height: 3px; background: var(--line); border-radius: 2px; overflow: hidden; }
@@ -279,6 +289,9 @@ code:not(pre code) {
   font-family: var(--mono); font-size: .855em;
   background: var(--bg-inset); padding: .14em .4em; border-radius: 4px;
   color: var(--accent-fg); border: 1px solid color-mix(in srgb, var(--line-2) 55%, transparent);
+  /* 长路径（pkg/device-plugin/nvidiadevice/... ）默认只在 - 处断行，
+     窄屏上一段就能把整页撑宽。anywhere 允许任意位置断，且会缩小 min-content 宽度 */
+  overflow-wrap: anywhere;
 }
 a code { color: inherit; border-color: transparent; }
 strong code, b code, th code { color: var(--fg); }
@@ -302,6 +315,7 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 48px 0; }
   font-family: var(--mono); font-size: 11px; color: var(--fg-3);
   flex-wrap: wrap;
 }
+.codeblock > header .path { min-width: 0; overflow-wrap: anywhere; }
 .codeblock > header .path b { color: var(--fg); font-weight: 700; }
 .codeblock > header .spacer { flex: 1 1 auto; }
 .codeblock > header a.gh,

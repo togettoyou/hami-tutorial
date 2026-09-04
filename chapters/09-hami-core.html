@@ -40,7 +40,7 @@
       </p>
     </div>
 
-    <h2>1. 劫持原理：换掉门口的接待员</h2>
+    <h2>1. 劫持原理：插到调用队伍的最前面</h2>
 
     <div class="note analogy">
       <div class="t">动态链接器的「插队」机制</div>
@@ -453,7 +453,7 @@ CHECK:
         </p>
         <div class="field-row">
           <div><label class="f">目标利用率 %（SM_LIMIT）</label><input type="number" id="tk_limit" value="30"></div>
-          <div><label class="f">应用的"胃口" %</label><input type="number" id="tk_demand" value="90"></div>
+          <div><label class="f">应用的「胃口」 %</label><input type="number" id="tk_demand" value="90"></div>
         </div>
         <div class="btns">
           <button class="btn" id="tk_step">推进一轮</button>
@@ -841,7 +841,7 @@ head -60 pkg/monitor/nvidia/v1/spec.go
     if (hist.length === 0) html += '<span class="dim">   点「推进一轮」开始</span>\n';
     html += `\n<span class="dim">观察：利用率会围绕目标值<b>震荡收敛</b>，不是硬性瞬时限制。
 偏差大时 increment 被放大（那行 "Accelerate cuda cores allocation"），收敛更快。
-令牌为负时 rate_limiter 会 nanosleep 阻塞 kernel launch —— 这就是"HAMi 让训练变慢"的来源。</span>`;
+令牌为负时 rate_limiter 会 nanosleep 阻塞 kernel launch —— 这就是「HAMi 让训练变慢」的来源。</span>`;
     out.innerHTML = html;
   }
 

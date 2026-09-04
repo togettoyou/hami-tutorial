@@ -23,8 +23,8 @@
       <h3>学完这章你应该能</h3>
       <ul>
         <li>说清楚为什么必须有 webhook —— 不加它 HAMi 根本不会被调用</li>
-        <li>按顺序背出 <code>Handle()</code> 的 8 个处理步骤</li>
-        <li>列出 4 种会被 <code>Denied</code> 的情况，并解释每种的理由</li>
+        <li>按顺序背出 <code>Handle()</code> 的 10 个处理步骤</li>
+        <li>列出 6 种会被 <code>Denied</code> 的情况，并解释每种的理由</li>
         <li>解释「只写 <code>gpumem</code> 不写 <code>gpu</code>」时 HAMi 帮你补了什么</li>
         <li>跑通 <code>Test_MutateAdmission</code> 并读懂它的用例</li>
       </ul>
@@ -109,7 +109,7 @@
       </p>
     </div>
 
-    <h2>3. Handle() 全流程：8 个步骤</h2>
+    <h2>3. Handle() 全流程：10 个步骤</h2>
 
     <p>
       这个函数只有 88 行，但它是整条链路上唯一能修改 Pod 的地方，
@@ -232,7 +232,7 @@
       </p>
     </div>
 
-    <h3>Step 6-7：三种拒绝 + 改 schedulerName</h3>
+    <h3>Step 6-9：四种拒绝 + 改 schedulerName</h3>
 
     <div class="codeblock" data-file="pkg/scheduler/webhook.go" data-start="106" data-lang="go" data-hl="4-7,9-12,17-18,20-23,26-28">
 <pre><code>	// Validate device-scoring weights for HAMi workloads so malformed input is
@@ -286,7 +286,7 @@
       </p>
     </div>
 
-    <h3>Step 8：生成 JSON Patch 返回</h3>
+    <h3>Step 10：生成 JSON Patch 返回</h3>
 
     <div class="codeblock" data-file="pkg/scheduler/webhook.go" data-start="133" data-lang="go" data-hl="6">
 <pre><code>	marshaledPod, err := json.Marshal(pod)
@@ -633,7 +633,7 @@ grep -rn "failurePolicy\|objectSelector\|namespaceSelector" charts/hami/template
       <li>Webhook 的<b>头号任务</b>是把 <code>schedulerName</code> 改成 <code>hami-scheduler</code>，
           否则 HAMi 根本不会被调用。</li>
       <li>它是整条链路上唯一能修改 Pod 的地方，之后只能加注解不能改 spec。</li>
-      <li>五种拒绝：无容器、numa-alignment 非法、打分权重非法、<b>特权容器 + GPU</b>、<b>已指定 nodeName</b>、超配额。</li>
+      <li>六种拒绝：无容器、numa-alignment 非法、打分权重非法、<b>特权容器 + GPU</b>、<b>已指定 nodeName</b>、超配额。</li>
       <li>自动补全两条隐式规则：<b>写了显存补卡数</b>、只写卡数补 gpucores=100（独占）。</li>
       <li>配额峰值公式 <code>max(initPeak, sidecar + app)</code>，
           三类容器三种占用模型 —— 第 05 章打分时会再遇到一次。</li>

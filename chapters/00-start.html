@@ -16,7 +16,7 @@
     <h1 class="page-title">开始之前：环境、全景与读码方法</h1>
     <p class="page-lede">
       别急着打开 <code>scheduler.go</code>。先花 30 分钟把仓库跑起来、建立一张地图、
-      学会三种"验证猜想"的手段 —— 后面每一章你都会用到它们。
+      学会三种「验证猜想」的手段 —— 后面每一章你都会用到它们。
     </p>
 
     <div class="goals">
@@ -25,11 +25,11 @@
         <li>说出 HAMi 的三个二进制分别叫什么、跑在哪、干什么</li>
         <li>在本地成功跑通至少一个单元测试（不需要 K8s 集群，不需要 GPU）</li>
         <li>拿到一个陌生函数名，30 秒内定位到它在哪个文件</li>
-        <li>知道遇到"这段代码到底怎么跑的"时，用哪三招去验证</li>
+        <li>知道遇到「这段代码到底怎么跑的」时，用哪三招去验证</li>
       </ul>
     </div>
 
-    <h2>1. HAMi 是什么：一句话和一个类比</h2>
+    <h2>1. HAMi 是什么：一句话和三个组件</h2>
 
     <p>
       一句话：HAMi 让一张物理 GPU 能被多个 Pod 安全地共享，并且让 Kubernetes 调度器知道该把 Pod 放到哪张卡上。
@@ -50,14 +50,14 @@
       <tr><td>Scheduler Extender</td><td>集群，多副本选主</td>
         <td>根据「要几张、要多少显存、要不要挨着」选出节点和具体的卡，把结果写进 Pod 注解</td></tr>
       <tr><td>HAMi-core</td><td>每个业务容器内</td>
-        <td>拦住越界：只租了 3000MB 显存，申请到 3001MB 就返回 OOM</td></tr>
+        <td>拦住越界：只分到 3000MB 显存，申请到 3001MB 就返回 OOM</td></tr>
     </table>
     </div>
 
     <p>
       这三件事分别由三个独立进程完成，它们<strong>不直接通信</strong>，
       而是通过 Kubernetes 上的注解（annotation）字符串传话。
-      这就是下一章要讲的"普通话"，也是整个项目的骨架。
+      这就是下一章要讲的注解协议，也是整个项目的骨架。
     </p>
 
     <h2>2. 环境准备（15 分钟）</h2>
@@ -88,7 +88,7 @@
 
     <p>
       本教程所有行号都对应 commit <code>95530c6</code>。<strong>强烈建议你也切过去</strong>，
-      这样文中说的"第 853 行"在你本地也确实是第 853 行。
+      这样文中说的「第 853 行」在你本地也确实是第 853 行。
     </p>
 
     <div class="codeblock" data-lang="bash">
@@ -144,7 +144,7 @@ $(DEVICES):
 
     <h2>3. 仓库全景：代码量分布决定你的投入</h2>
 
-    <p>拿到一个 28,000 行的项目，第一件事是搞清楚"重量"分布在哪。</p>
+    <p>拿到一个 28,000 行的项目，第一件事是搞清楚「重量」分布在哪。</p>
 
     <div class="lab">
       <header>代码量分布<span class="badge">互动</span></header>
@@ -203,7 +203,7 @@ $(DEVICES):
 
     <p>
       这是整套教程<strong>最重要的一招</strong>。HAMi 的核心函数都是纯函数，
-      项目自带的表驱动测试就是最好的"交互式解释器"。
+      项目自带的表驱动测试就是最好的「交互式解释器」。
     </p>
 
     <h3>实验 4.1：跑通注解编解码测试</h3>
@@ -223,7 +223,7 @@ sed -n '49,120p' pkg/device/devices_test.go</code></pre>
     <h3>实验 4.2：故意改坏一个用例，观察失败信息</h3>
 
     <p>
-      这一步<strong>不要跳过</strong>。理解一个函数最快的方式，是看它"什么时候不工作"。
+      这一步<strong>不要跳过</strong>。理解一个函数最快的方式，是看它「什么时候不工作」。
     </p>
 
     <ol class="steps">
@@ -249,7 +249,7 @@ sed -n '49,120p' pkg/device/devices_test.go</code></pre>
     <div class="note tip">
       <div class="t">为什么这招管用</div>
       <p style="margin-bottom:0">
-        读代码是"我猜它会这样"，跑测试是"它确实这样"。
+        读代码是「我猜它会这样」，跑测试是「它确实这样」。
         HAMi 的 Fit 函数有十几个 continue 分支，光靠眼睛读，
         你永远不确定某个条件到底会不会触发。改一个输入跑一次，2 秒就有答案。
       </p>
@@ -271,19 +271,19 @@ go test ./pkg/... -short -race -count=1</code></pre>
     <div class="note warn">
       <div class="t">关于 <code>-count=1</code></div>
       <p style="margin-bottom:0">
-        Go 会缓存测试结果。改了代码但测试"秒过"且输出 <code>(cached)</code>，
+        Go 会缓存测试结果。改了代码但测试「秒过」且输出 <code>(cached)</code>，
         说明它根本没重跑。养成永远带 <code>-count=1</code> 的习惯。
       </p>
     </div>
 
     <h2>5. 读码三板斧</h2>
 
-    <p>后面每一章遇到"这段代码怎么跑的"，都靠这三招。</p>
+    <p>后面每一章遇到「这段代码怎么跑的」，都靠这三招。</p>
 
     <h3>第一斧：按签名搜索，30 秒定位</h3>
 
     <p>
-      HAMi 命名很规整，接口方法名固定。想找"NVIDIA 的 Fit 在哪"：
+      HAMi 命名很规整，接口方法名固定。想找「NVIDIA 的 Fit 在哪」：
     </p>
 
     <div class="codeblock" data-lang="bash">
@@ -302,7 +302,7 @@ grep -rn "hami.io/vgpu-node" --include=*.go .</code></pre>
     <p>
       <code>main.go</code> 里全是 flag 解析和启动逻辑，信息密度很低。
       真正的业务逻辑，测试文件读起来比源文件快得多，因为测试直接告诉你
-      "输入长这样，输出应该长这样"。
+      「输入长这样，输出应该长这样」。
     </p>
 
     <div class="tbl-wrap">
@@ -397,14 +397,14 @@ func TestScratch(t *testing.T) {
     <h2>7. 小结</h2>
 
     <ul>
-      <li>HAMi = <b>前台登记</b>（device plugin）+ <b>排房系统</b>（scheduler）+ <b>门禁</b>（HAMi-core），三者靠<b>注解字符串</b>传话。</li>
+      <li>HAMi = <b>Device Plugin</b>（汇报每张卡的规格与余量）+ <b>Scheduler Extender</b>（选节点选卡，把结果写进注解）+ <b>HAMi-core</b>（在容器里拦住越界），三个进程不直接通信，全靠<b>注解字符串</b>传话。</li>
       <li>真正需要精读的核心大约 <b>5,000 行</b>，不是 28,000 行。</li>
       <li>核心逻辑全是纯函数，<b>用单元测试当调试器</b>，不需要集群不需要 GPU。</li>
       <li>三板斧：<b>按签名 grep</b> 定位、<b>跟着测试读</b>、<b>加日志或写临时测试</b>验证。</li>
     </ul>
 
     <p class="next-hint">既然三个进程靠字符串通信，那就先把这串字符串弄清楚。
-        下一章你会亲手在浏览器里编解码 HAMi 的注解，看懂之后回头再读代码，会有种"原来如此"的感觉。</p>
+        下一章你会亲手在浏览器里编解码 HAMi 的注解，看懂之后回头再读代码，会有种「原来如此」的感觉。</p>
 
     <div class="chapter-nav" id="chapterNav"></div>
   </main>

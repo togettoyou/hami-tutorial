@@ -13,7 +13,7 @@
   <main class="main">
 
     <div class="page-kicker">第 01 章 · 第一阶段 打地基</div>
-    <h1 class="page-title">注解协议：HAMi 的「普通话」</h1>
+    <h1 class="page-title">注解协议：三个进程之间的公告栏</h1>
     <p class="page-lede">
       调度器、设备插件、监控三个进程从不直连。它们把所有要说的话，
       编码成一行逗号冒号分号拼起来的字符串，塞进 Kubernetes 的注解里。
@@ -42,10 +42,10 @@
       <div class="t">明信片，而不是电话</div>
       <p>
         调度器和设备插件跑在<strong>不同的机器上</strong>，而且都可能随时重启。
-        如果用"打电话"（gRPC 直连），一方重启另一方就断线，还得处理服务发现、重连、鉴权。
+        如果用「打电话」（gRPC 直连），一方重启另一方就断线，还得处理服务发现、重连、鉴权。
       </p>
       <p style="margin-bottom:0">
-        HAMi 选的是"寄明信片"：所有信息都写在 kube-apiserver 这个<strong>公告栏</strong>上。
+        HAMi 选的是「寄明信片」：所有信息都写在 kube-apiserver 这个<strong>公告栏</strong>上。
         谁重启了都不要紧，起来重新看一眼公告栏就知道当前状态。
         代价是 —— 明信片背面地方小，所以要把信息压缩成最紧凑的字符串。
       </p>
@@ -55,7 +55,7 @@
     <table>
       <tr><th style="width:120px">方案</th><th>优点</th><th>为什么 HAMi 没选</th></tr>
       <tr><td>gRPC 直连</td><td>类型安全、高效</td><td>需要服务发现、重连、TLS；组件重启就丢状态</td></tr>
-      <tr><td>自定义 CRD</td><td>结构化、可校验</td><td>要装 CRD、要 RBAC、要 controller；对"每 30 秒更新一次"的高频写入太重</td></tr>
+      <tr><td>自定义 CRD</td><td>结构化、可校验</td><td>要装 CRD、要 RBAC、要 controller；对「每 30 秒更新一次」的高频写入太重</td></tr>
       <tr><td><b>注解字符串</b></td><td>零额外部署、天然持久化、kubectl 就能看</td><td>—（选它）</td></tr>
     </table>
     </div>
@@ -444,8 +444,7 @@ func UnMarshalNodeDevices(str string) ([]*DeviceInfo, error) {
         <code>devDecoded := device.EncodeNodeDevices(nodedevices)</code>。把刚解析出来的对象再编码成逗号串，只为了打一行 V(5) 日志，
         因为逗号串比 JSON 短得多，日志里更好读。
         <br><strong>它不会被写回任何注解。</strong>
-        <br><em>如果你在调度器日志里看到逗号格式的设备清单，别误以为注解就长那样 ——
-        这也是本教程之前版本弄错的地方。</em>
+        <br><em>如果你在调度器日志里看到逗号格式的设备清单，别误以为注解就长那样。</em>
         <br>顺带一提：这行代码<strong>无论日志级别开没开都会执行</strong>
         （参数在调用前就求值了）。在大节点上这是个可以微优化的点。
       </p>
@@ -481,10 +480,10 @@ func UnMarshalNodeDevices(str string) ([]*DeviceInfo, error) {
     <div class="note tip">
       <div class="t">为什么每段末尾都有多余的分隔符</div>
       <p style="margin-bottom:0">
-        编码时是<strong>无条件在每个元素后追加分隔符</strong>（而不是"元素之间插入"），
+        编码时是<strong>无条件在每个元素后追加分隔符</strong>（而不是「元素之间插入」），
         所以字符串总是以 <code>:</code> 或 <code>;</code> 结尾。
         解析时靠 <code>if val == "" { continue }</code> 跳过末尾产生的空段。
-        写代码时这样最省事，但也意味着空字符串和"一个空容器"在编码后长得一样。
+        写代码时这样最省事，但也意味着空字符串和「一个空容器」在编码后长得一样。
       </p>
     </div>
 
@@ -609,8 +608,8 @@ func EncodePodDevices(checklist map[string]string, pd PodDevices) map[string]str
     <div class="note analogy">
       <div class="t">点名答到</div>
       <p style="margin-bottom:0">
-        调度器（老师）在注解上写 <code>Requesting_{当前时间}</code>（"点名了，报数"）。<br>
-        设备插件（学生）看到后，把它改成 <code>Reported {当前时间}</code>（"到！"）。<br>
+        调度器（老师）在注解上写 <code>Requesting_{当前时间}</code>（「点名了，报数」）。<br>
+        设备插件（学生）看到后，把它改成 <code>Reported {当前时间}</code>（「到！」）。<br>
         如果老师发现自己写的 <code>Requesting</code> 超过一定时间还没被改成 <code>Reported</code>，
         就认为这个学生不在了。
       </p>
@@ -845,7 +844,7 @@ rm pkg/device/scratch_test.go   # 用完删掉</code></pre></div>
       <div class="opt" data-k="D"><span class="k">D</span><span>历史遗留，其实是重复的</span></div>
       <div class="expl">
         两条注解写入时内容<strong>完全一样</strong>，但生命周期不同：
-        <code>to-allocate</code> 是给设备插件的"工单"，处理完就清掉，防止 Pod 重启时重复分配；
+        <code>to-allocate</code> 是给设备插件的「工单」，处理完就清掉，防止 Pod 重启时重复分配；
         <code>allocated</code> 保留下来，vGPUmonitor 和用量统计都靠读它来知道这个 Pod 占了哪些卡。
         见 <code>PatchAnnotations</code>（<code>device.go:513</code>）里连着写的那两行。
       </div>
@@ -864,7 +863,7 @@ rm pkg/device/scratch_test.go   # 用完删掉</code></pre></div>
       <li>各厂商注解 key 不统一，靠 <code>InRequestDevices</code> / <code>SupportDevices</code> 两张全局注册表映射。</li>
     </ul>
 
-    <p class="next-hint">知道了"说什么话"，接下来看"谁在说" ——
+    <p class="next-hint">知道了「说什么话」，接下来看「谁在说」 ——
         <code>Devices</code> 接口的 15 个方法，是 12 家硬件厂商共同遵守的契约。
         看懂它，你就知道加一个新硬件要写哪些代码。</p>
 

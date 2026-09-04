@@ -326,7 +326,7 @@ kubectl logs -n kube-system deploy/hami-scheduler -c vgpu-scheduler-extender --t
     { k: 'Less 排序 binpack spread mutex numa', t: 'DeviceUsageList.Less()', f: 'pkg/scheduler/policy/gpu_policy.go:78', c: '05', d: '决定选卡顺序。配合 Fit 的倒序遍历一起看才能理解。' },
     { k: 'ComputeDefaultScore 节点打分', t: 'NodeScore.ComputeDefaultScore()', f: 'pkg/scheduler/policy/node_policy.go:110', c: '05', d: '节点基础分。注意它不支持自定义权重（一个可改进点）。' },
     { k: 'OverrideScore 后端加分 policyNeutralScorer', t: 'NodeScore.OverrideScore()', f: 'pkg/scheduler/policy/node_policy.go:69', c: '05', d: '叠加后端加分，用标记接口统一处理策略适配。权重 10000 保证后端分数压倒基础分。' },
-    { k: 'Handle webhook 准入 schedulerName', t: 'webhook.Handle()', f: 'pkg/scheduler/webhook.go:54', c: '03', d: '改 schedulerName、补默认值、5 种拒绝场景。' },
+    { k: 'Handle webhook 准入 schedulerName', t: 'webhook.Handle()', f: 'pkg/scheduler/webhook.go:54', c: '03', d: '改 schedulerName、补默认值、6 种拒绝场景。' },
     { k: 'MutateAdmission 补默认值 环境变量', t: 'NvidiaGPUDevices.MutateAdmission()', f: 'pkg/device/nvidia/device.go:334', c: '03', d: '校验参数、注入 env、补卡数和独占算力、设置 RuntimeClass。' },
     { k: 'GenerateResourceRequests 翻译 limits 101', t: 'GenerateResourceRequests()', f: 'pkg/device/nvidia/device.go:528', c: '02', d: '把 resources.limits 翻译成 ContainerDeviceRequest。101 是「未设置」哨兵。' },
     { k: 'AddResourceUsage 记账 MIG profile', t: 'AddResourceUsage()', f: 'pkg/device/nvidia/device.go:779', c: '05/10', d: 'Used++ / Usedmem+= / Usedcores+=。MIG 模式下还会覆写请求值为 profile 规格。' },
